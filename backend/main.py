@@ -13,7 +13,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB = "invest.db"
+import os
+DB_DIR = os.environ.get("DB_DIR", ".")   # 默认存当前文件夹;线上会改成硬盘目录
+DB = os.path.join(DB_DIR, "invest.db")
 
 def init_db():
     conn = sqlite3.connect(DB)
