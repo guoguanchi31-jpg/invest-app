@@ -58,10 +58,20 @@ function App() {
   const totalValue = holdings.reduce((sum, i) => sum + i.market_value, 0);
   const totalProfit = holdings.reduce((sum, i) => sum + i.profit, 0);
 
+  const handleRefresh = async () => {
+  await fetch(`${API}/refresh`, { method: "POST" });
+  // 刷新完再重新拉一次最新数据
+  const res = await fetch(`${API}/holdings`);
+  const data = await res.json();
+  setHoldings(data);
+};
+
   return (
     <div style={{ maxWidth: 1000, margin: "40px auto", fontFamily: "sans-serif" }}>
       <h1>我的投资系统</h1>
-
+<button onClick={handleRefresh} style={{ marginBottom: "10px", padding: "8px 16px" }}>
+  🔄 刷新行情
+</button>
       <div style={{ margin: "16px 0", fontSize: 18 }}>
         总市值:<b>{totalValue.toFixed(2)}</b>　
         总盈亏:
