@@ -16,6 +16,8 @@ app.add_middleware(
 import os
 DB_DIR = os.environ.get("DB_DIR", ".")   # 默认存当前文件夹;线上会改成硬盘目录
 DB = os.path.join(DB_DIR, "invest.db")
+# 登录密码:从环境变量读,本地默认 123456
+PASSWORD = os.environ.get("APP_PASSWORD", "123456")
 
 def init_db():
     conn = sqlite3.connect(DB)
@@ -81,6 +83,15 @@ def fetch_price(code):
     current = float(parts[3])  # 第4个字段(下标3)是当前价
     return current if current > 0 else None
 
+class LoginData(BaseModel):
+    password: str
+
+@app.post("/login")
+def login(data: LoginData):
+    if data.password == PASSWORD:
+        return {"ok": True}
+    return {"ok": False}
+    
 @app.get("/")
 def read_root():
     return {"message": "我的投资系统后端已启动!"}

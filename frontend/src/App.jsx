@@ -5,6 +5,9 @@ const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 function App() {
   const [holdings, setHoldings] = useState([]);
 
+  const [loggedIn, setLoggedIn] = useState(localStorage.getItem("loggedIn") === "true");
+const [password, setPassword] = useState("");
+
   // 表单里输入的内容
   const [form, setForm] = useState({
     name: "", code: "", buy_price: "", quantity: "", current_price: "",
@@ -18,6 +21,21 @@ function App() {
   };
 
   useEffect(() => { loadData(); }, []);
+
+  const handleLogin = async () => {
+  const res = await fetch(`${API}/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  const data = await res.json();
+  if (data.ok) {
+    setLoggedIn(true);
+    localStorage.setItem("loggedIn", "true");
+  } else {
+    alert("密码错误");
+  }
+};
 
   // 输入框变化时更新 form
   const handleChange = (e) => {
@@ -66,6 +84,22 @@ function App() {
   setHoldings(data);
 };
 
+  if (!loggedIn) {
+    return (
+      <div style={{ maxWidth: 300, margin: "100px auto", textAlign: "center" }}>
+        <h2>请输入密码</h2>
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") handleLogin(); }}
+          style={{ padding: 8, width: "100%", marginBottom: 10 }}
+        />
+        <button onClick={handleLogin} style={{ padding: "8px 16px" }}>登录</button>
+      </div>
+    );
+  }
+  
   return (
     <div style={{ maxWidth: 1000, margin: "40px auto", fontFamily: "sans-serif" }}>
       <h1>我的投资系统</h1>
