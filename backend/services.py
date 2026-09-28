@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 from io import StringIO
@@ -7,6 +8,9 @@ from io import StringIO
 import requests
 
 from database import get_connection, rows_to_dicts
+
+
+BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "CNY").strip().upper() or "CNY"
 
 
 def current_month():
@@ -54,8 +58,7 @@ def get_snapshot_trend(metric, month=None, range_key="12m", limit=12):
             f"""
             SELECT snapshot_date AS date, {metric} AS value
             FROM snapshots
-            WHERE {metric} > 0
-              AND substr(snapshot_date, 1, 7) = ?
+            WHERE substr(snapshot_date, 1, 7) = ?
             ORDER BY snapshot_date
             """,
             (month,),
@@ -67,12 +70,17 @@ def get_snapshot_trend(metric, month=None, range_key="12m", limit=12):
     placeholders = ",".join("?" for _ in months)
     rows = conn.execute(
         f"""
-        SELECT substr(snapshot_date, 1, 7) AS date, MAX({metric}) AS value
-        FROM snapshots
-        WHERE {metric} > 0
-          AND substr(snapshot_date, 1, 7) IN ({placeholders})
-        GROUP BY substr(snapshot_date, 1, 7)
-        ORDER BY date
+        SELECT substr(s.snapshot_date, 1, 7) AS date, s.{metric} AS value
+        FROM snapshots s
+        JOIN (
+            SELECT
+                substr(snapshot_date, 1, 7) AS snapshot_month,
+                MAX(snapshot_date) AS snapshot_date
+            FROM snapshots
+            WHERE substr(snapshot_date, 1, 7) IN ({placeholders})
+            GROUP BY 1
+        ) latest ON latest.snapshot_date = s.snapshot_date
+        ORDER BY 1
         """,
         tuple(months),
     ).fetchall()
@@ -92,7 +100,9 @@ def filter_trend_by_data_start(trend, data_start):
 
 
 def merge_realtime_trend_point(trend, month, range_key, value):
-    point_date = date.today().isoformat() if month == current_month() else month
+    if month != current_month():
+        return trend
+    point_date = date.today().isoformat()
     point = {"date": point_date if range_key == "month" else month, "value": round(value, 2)}
     filtered = [item for item in trend if item["date"] != point["date"]]
     if range_key != "month":
@@ -110,20 +120,32 @@ def month_days(month_value):
 
 def calc_holding(row):
     item = dict(row)
-    cost = (item.get("buy_price") or 0) * (item.get("quantity") or 0)
-    market_value = (item.get("current_price") or 0) * (item.get("quantity") or 0)
+    exchange_rate = item.get("exchange_rate_to_base") or 1
+    original_cost = (item.get("buy_price") or 0) * (item.get("quantity") or 0)
+    original_market_value = (item.get("current_price") or 0) * (item.get("quantity") or 0)
+    cost = original_cost * exchange_rate
+    market_value = original_market_value * exchange_rate
     profit = market_value - cost
     profit_rate = profit / cost * 100 if cost else 0
+    item["cost"] = round(cost, 2)
+    item["cost_original"] = round(original_cost, 2)
+    item["market_value_original"] = round(original_market_value, 2)
     item["market_value"] = round(market_value, 2)
     item["profit"] = round(profit, 2)
     item["profit_rate"] = round(profit_rate, 2)
+    item["base_currency"] = BASE_CURRENCY
     return item
 
 
 def get_investment_values_by_account(conn):
     rows = conn.execute(
         """
-        SELECT account_id, COALESCE(SUM(COALESCE(current_price, 0) * COALESCE(quantity, 0)), 0) AS value
+        SELECT account_id,
+               COALESCE(SUM(
+                   COALESCE(current_price, 0)
+                   * COALESCE(quantity, 0)
+                   * COALESCE(exchange_rate_to_base, 1)
+               ), 0) AS value
         FROM holdings
         WHERE account_id IS NOT NULL
         GROUP BY account_id
@@ -136,12 +158,21 @@ def apply_investment_account_values(accounts, investment_values):
     adjusted = []
     for account in accounts:
         item = dict(account)
+        exchange_rate = item.get("exchange_rate_to_base") or 1
+        original_balance = item.get("balance") or 0
+        item["original_balance"] = round(original_balance, 2)
+        item["base_currency"] = BASE_CURRENCY
         if item.get("type") == "investment" and not item.get("is_liability"):
             holdings_value = investment_values.get(item["id"], 0)
-            cash_available = item.get("cash_available") or 0
+            original_cash_available = item.get("cash_available") or 0
+            cash_available = original_cash_available * exchange_rate
             item["holdings_value"] = round(holdings_value, 2)
+            item["cash_available_original"] = round(original_cash_available, 2)
+            item["cash_available"] = round(cash_available, 2)
             item["balance"] = round(holdings_value + cash_available, 2)
             item["balance_source"] = "investment_holdings_plus_cash"
+        else:
+            item["balance"] = round(original_balance * exchange_rate, 2)
         adjusted.append(item)
     return adjusted
 
@@ -352,9 +383,12 @@ def get_holdings():
     conn = get_connection()
     rows = conn.execute(
         """
-        SELECT h.*, a.name AS account_name
+        SELECT h.*, a.name AS account_name, a.owner AS account_owner,
+               CASE WHEN a.id IS NOT NULL THEN 1 ELSE 0 END AS included_in_totals
         FROM holdings h
         LEFT JOIN accounts a ON a.id = h.account_id
+        WHERE h.account_id IS NULL
+           OR (a.is_active = 1 AND a.type = 'investment' AND a.is_liability = 0)
         ORDER BY h.id
         """
     ).fetchall()
@@ -364,7 +398,12 @@ def get_holdings():
 
 def refresh_holding_prices():
     conn = get_connection()
-    rows = conn.execute("SELECT id, name, code, market, asset_type, current_price FROM holdings").fetchall()
+    rows = conn.execute("""
+        SELECT h.id, h.name, h.code, h.market, h.asset_type, h.current_price
+        FROM holdings h LEFT JOIN accounts a ON a.id = h.account_id
+        WHERE h.account_id IS NULL
+           OR (a.is_active = 1 AND a.type = 'investment' AND a.is_liability = 0)
+    """).fetchall()
     updated = 0
     failed = 0
     skipped = 0
@@ -454,14 +493,16 @@ def get_recent_transactions(limit=5, month=None):
     rows = conn.execute(
         f"""
         SELECT
-            t.id, t.account_id, t.category_id, t.amount, t.direction, t.occurred_at, t.merchant, t.note,
+            t.id, t.account_id, t.category_id, t.amount, t.currency,
+            t.exchange_rate_to_base, t.base_amount,
+            t.direction, t.occurred_at, t.merchant, t.note,
             a.name AS account_name,
             a.owner AS account_owner,
             c.name AS category_name, c.icon, c.color
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.account_id
         LEFT JOIN categories c ON c.id = t.category_id
-        WHERE COALESCE(t.source, 'manual') != 'transfer'
+        WHERE COALESCE(t.source, 'manual') = 'manual'
           {month_filter}
         ORDER BY t.occurred_at DESC, t.id DESC
         LIMIT ?
@@ -478,11 +519,11 @@ def get_dashboard_summary(month=None, trend_range="12m"):
     monthly = conn.execute(
         """
         SELECT
-            SUM(CASE WHEN direction = 'income' THEN amount ELSE 0 END) AS income,
-            SUM(CASE WHEN direction = 'expense' THEN amount ELSE 0 END) AS expense
+            SUM(CASE WHEN direction = 'income' THEN base_amount ELSE 0 END) AS income,
+            SUM(CASE WHEN direction = 'expense' THEN base_amount ELSE 0 END) AS expense
         FROM transactions
         WHERE substr(occurred_at, 1, 7) = ?
-          AND COALESCE(source, 'manual') != 'transfer'
+          AND COALESCE(source, 'manual') = 'manual'
         """,
         (month,),
     ).fetchone()
@@ -536,6 +577,7 @@ def get_dashboard_summary(month=None, trend_range="12m"):
     trend = merge_realtime_trend_point(trend, month, trend_range, net_worth) if accounts else []
 
     return {
+        "base_currency": BASE_CURRENCY,
         "net_worth": round(net_worth, 2),
         "asset_total": round(asset_total, 2),
         "liability_total": round(liability_total, 2),
@@ -564,6 +606,7 @@ def get_accounts_overview():
     liability_total = sum(item["balance"] for item in accounts if item["is_liability"])
     net_worth = asset_total - liability_total
     return {
+        "base_currency": BASE_CURRENCY,
         "asset_total": round(asset_total, 2),
         "liability_total": round(liability_total, 2),
         "net_worth": round(net_worth, 2),
@@ -589,14 +632,17 @@ def get_expense_analysis(month=None, expense_range="month", cashflow_range="mont
     conn = get_connection()
     category_rows = conn.execute(
         f"""
-        SELECT c.id, c.name, c.icon, c.color, COALESCE(SUM(t.amount), 0) AS amount
-        FROM categories c
-        LEFT JOIN transactions t
-            ON t.category_id = c.id
-            AND t.direction = 'expense'
-            AND COALESCE(t.source, 'manual') != 'transfer'
-            AND substr(t.occurred_at, 1, 7) IN ({expense_placeholders})
-        WHERE c.type = 'expense'
+        SELECT
+            c.id,
+            COALESCE(c.name, '未分类') AS name,
+            COALESCE(c.icon, '🧾') AS icon,
+            COALESCE(c.color, '#827f77') AS color,
+            SUM(t.base_amount) AS amount
+        FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
+        WHERE t.direction = 'expense'
+          AND COALESCE(t.source, 'manual') = 'manual'
+          AND substr(t.occurred_at, 1, 7) IN ({expense_placeholders})
         GROUP BY c.id, c.name, c.icon, c.color
         ORDER BY amount DESC
         """,
@@ -606,15 +652,15 @@ def get_expense_analysis(month=None, expense_range="month", cashflow_range="mont
         f"""
         SELECT
             CASE WHEN ? = 'month' THEN substr(occurred_at, 1, 10) ELSE substr(occurred_at, 1, 7) END AS month,
-            SUM(CASE WHEN direction = 'income' THEN amount ELSE 0 END) AS income,
-            SUM(CASE WHEN direction = 'expense' THEN amount ELSE 0 END) AS expense
+            SUM(CASE WHEN direction = 'income' THEN base_amount ELSE 0 END) AS income,
+            SUM(CASE WHEN direction = 'expense' THEN base_amount ELSE 0 END) AS expense
         FROM transactions
         WHERE substr(occurred_at, 1, 7) IN ({cashflow_placeholders})
-          AND COALESCE(source, 'manual') != 'transfer'
-        GROUP BY CASE WHEN ? = 'month' THEN substr(occurred_at, 1, 10) ELSE substr(occurred_at, 1, 7) END
-        ORDER BY month
+          AND COALESCE(source, 'manual') = 'manual'
+        GROUP BY 1
+        ORDER BY 1
         """,
-        (cashflow_range, *cashflow_months, cashflow_range),
+        (cashflow_range, *cashflow_months),
     ).fetchall()
     conn.close()
 
@@ -639,6 +685,7 @@ def get_expense_analysis(month=None, expense_range="month", cashflow_range="mont
         "month": month,
         "expense_range": expense_range,
         "cashflow_range": cashflow_range,
+        "base_currency": BASE_CURRENCY,
         "total_expense": round(total, 2),
         "daily_average": round(daily_average, 2),
         "largest_category": largest,
@@ -656,14 +703,17 @@ def get_income_analysis(month=None, income_range="month", trend_range="month"):
     conn = get_connection()
     category_rows = conn.execute(
         f"""
-        SELECT c.id, c.name, c.icon, c.color, COALESCE(SUM(t.amount), 0) AS amount
-        FROM categories c
-        LEFT JOIN transactions t
-            ON t.category_id = c.id
-            AND t.direction = 'income'
-            AND COALESCE(t.source, 'manual') != 'transfer'
-            AND substr(t.occurred_at, 1, 7) IN ({income_placeholders})
-        WHERE c.type = 'income'
+        SELECT
+            c.id,
+            COALESCE(c.name, '未分类') AS name,
+            COALESCE(c.icon, '💰') AS icon,
+            COALESCE(c.color, '#827f77') AS color,
+            SUM(t.base_amount) AS amount
+        FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
+        WHERE t.direction = 'income'
+          AND COALESCE(t.source, 'manual') = 'manual'
+          AND substr(t.occurred_at, 1, 7) IN ({income_placeholders})
         GROUP BY c.id, c.name, c.icon, c.color
         ORDER BY amount DESC
         """,
@@ -673,15 +723,15 @@ def get_income_analysis(month=None, income_range="month", trend_range="month"):
         f"""
         SELECT
             CASE WHEN ? = 'month' THEN substr(occurred_at, 1, 10) ELSE substr(occurred_at, 1, 7) END AS month,
-            SUM(amount) AS income
+            SUM(base_amount) AS income
         FROM transactions
         WHERE direction = 'income'
           AND substr(occurred_at, 1, 7) IN ({trend_placeholders})
-          AND COALESCE(source, 'manual') != 'transfer'
-        GROUP BY CASE WHEN ? = 'month' THEN substr(occurred_at, 1, 10) ELSE substr(occurred_at, 1, 7) END
-        ORDER BY month
+          AND COALESCE(source, 'manual') = 'manual'
+        GROUP BY 1
+        ORDER BY 1
         """,
-        (trend_range, *trend_months, trend_range),
+        (trend_range, *trend_months),
     ).fetchall()
     conn.close()
 
@@ -706,6 +756,7 @@ def get_income_analysis(month=None, income_range="month", trend_range="month"):
         "month": month,
         "income_range": income_range,
         "trend_range": trend_range,
+        "base_currency": BASE_CURRENCY,
         "total_income": round(total, 2),
         "daily_average": round(daily_average, 2),
         "largest_category": largest,
@@ -722,13 +773,13 @@ def get_budget_monthly(month=None):
         SELECT
             b.id, b.amount AS budget, b.alert_threshold,
             c.id AS category_id, c.name, c.icon, c.color,
-            COALESCE(SUM(t.amount), 0) AS used
+            COALESCE(SUM(t.base_amount), 0) AS used
         FROM budgets b
         JOIN categories c ON c.id = b.category_id
         LEFT JOIN transactions t
             ON t.category_id = c.id
             AND t.direction = 'expense'
-            AND COALESCE(t.source, 'manual') != 'transfer'
+            AND COALESCE(t.source, 'manual') = 'manual'
             AND substr(t.occurred_at, 1, 7) = b.month
         WHERE b.month = ?
         GROUP BY b.id, b.amount, b.alert_threshold, c.id, c.name, c.icon, c.color, c.sort_order
@@ -760,6 +811,7 @@ def get_budget_monthly(month=None):
         })
     return {
         "month": month,
+        "base_currency": BASE_CURRENCY,
         "total_budget": round(total_budget, 2),
         "total_used": round(total_used, 2),
         "left": round(total_budget - total_used, 2),
@@ -770,14 +822,16 @@ def get_budget_monthly(month=None):
 
 def get_investment_summary(month=None, trend_range="12m"):
     month = month or current_month()
-    holdings = get_holdings()
+    all_holdings = get_holdings()
+    holdings = [item for item in all_holdings if item["included_in_totals"]]
     total_value = sum(item["market_value"] for item in holdings)
-    total_cost = sum((item.get("buy_price") or 0) * (item.get("quantity") or 0) for item in holdings)
+    total_cost = sum(item["cost"] for item in holdings)
     total_profit = total_value - total_cost
     conn = get_connection()
     investment_accounts = rows_to_dicts(conn.execute(
         """
-        SELECT id, name, owner, COALESCE(cash_available, 0) AS cash_available
+        SELECT id, name, owner, currency, exchange_rate_to_base,
+               COALESCE(cash_available, 0) AS cash_available
         FROM accounts
         WHERE is_active = 1
           AND is_liability = 0
@@ -787,25 +841,31 @@ def get_investment_summary(month=None, trend_range="12m"):
     ).fetchall())
     data_start = conn.execute(
         """
-        SELECT MIN(substr(updated_at, 1, 10)) AS data_start
-        FROM holdings
-        WHERE updated_at IS NOT NULL AND updated_at != ''
+        SELECT MIN(snapshot_date) AS data_start
+        FROM snapshots
+        WHERE investment_value > 0
         """
     ).fetchone()["data_start"]
     conn.close()
     if holdings and not data_start:
         data_start = date.today().isoformat()
+    for item in investment_accounts:
+        original_cash = item["cash_available"]
+        item["cash_available_original"] = round(original_cash, 2)
+        item["cash_available"] = round(original_cash * (item["exchange_rate_to_base"] or 1), 2)
     cash_available = sum(item["cash_available"] for item in investment_accounts)
     allocation = {}
     for item in holdings:
         asset_type = item.get("asset_type") or "stock"
         allocation[asset_type] = allocation.get(asset_type, 0) + item["market_value"]
     trend = filter_trend_by_data_start(get_snapshot_trend("investment_value", month, trend_range), data_start)
-    trend = merge_realtime_trend_point(trend, month, trend_range, total_value) if total_value else []
+    if investment_accounts or holdings:
+        trend = merge_realtime_trend_point(trend, month, trend_range, total_value)
     return {
         "total_value": round(total_value, 2),
         "total_profit": round(total_profit, 2),
         "profit_rate": round(total_profit / total_cost * 100, 1) if total_cost else 0,
+        "base_currency": BASE_CURRENCY,
         "cash_available": round(cash_available, 2),
         "cash_accounts": [
             {
@@ -818,7 +878,7 @@ def get_investment_summary(month=None, trend_range="12m"):
             {"name": name, "value": round(value, 2), "percent": round(value / total_value * 100, 1) if total_value else 0}
             for name, value in allocation.items()
         ],
-        "holdings": holdings,
+        "holdings": all_holdings,
         "trend": trend,
         "trend_scope": trend_range,
     }
@@ -888,7 +948,7 @@ def get_goals_overview(month=None, plan_range="12m"):
 def refresh_warehouse_snapshot(snapshot_date=None):
     snapshot_date = snapshot_date or date.today().isoformat()
     now = datetime.now().isoformat(timespec="seconds")
-    holdings = get_holdings()
+    holdings = [item for item in get_holdings() if item["included_in_totals"]]
     investment_value = sum(item["market_value"] for item in holdings)
 
     conn = get_connection()
@@ -949,11 +1009,11 @@ def get_warehouse_overview():
         """
         SELECT
             substr(occurred_at, 1, 7) AS month,
-            SUM(CASE WHEN direction = 'income' THEN amount ELSE 0 END) AS income,
-            SUM(CASE WHEN direction = 'expense' THEN amount ELSE 0 END) AS expense
+            SUM(CASE WHEN direction = 'income' THEN base_amount ELSE 0 END) AS income,
+            SUM(CASE WHEN direction = 'expense' THEN base_amount ELSE 0 END) AS expense
         FROM transactions
         WHERE occurred_at >= ?
-          AND COALESCE(source, 'manual') != 'transfer'
+          AND COALESCE(source, 'manual') = 'manual'
         GROUP BY substr(occurred_at, 1, 7)
         ORDER BY month
         """,
@@ -961,22 +1021,24 @@ def get_warehouse_overview():
     ).fetchall()
     income_category_rows = conn.execute(
         """
-        SELECT c.name, c.icon, c.color, COALESCE(SUM(t.amount), 0) AS amount
+        SELECT c.name, c.icon, c.color,
+               COALESCE(SUM(t.base_amount), 0) AS amount
         FROM categories c
         LEFT JOIN transactions t
             ON t.category_id = c.id
             AND t.direction = 'income'
             AND t.occurred_at >= ?
-            AND COALESCE(t.source, 'manual') != 'transfer'
+            AND COALESCE(t.source, 'manual') = 'manual'
         WHERE c.type = 'income'
         GROUP BY c.id, c.name, c.icon, c.color
-        HAVING amount > 0
+        HAVING COALESCE(SUM(t.base_amount), 0) > 0
         ORDER BY amount DESC
         """,
         (start_date,),
     ).fetchall()
     conn.close()
     return {
+        "base_currency": BASE_CURRENCY,
         "snapshot": today_snapshot,
         "snapshots": snapshots,
         "monthly_cashflow": rows_to_dicts(monthly_rows),

@@ -1,11 +1,52 @@
+import math
 import os
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 
 
 DB_DIR = os.environ.get("DB_DIR", ".")
 DB = os.path.join(DB_DIR, "invest.db")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "CNY").strip().upper() or "CNY"
+FINANCIAL_TABLES = [
+    "accounts", "categories", "transactions", "holdings", "investment_trades",
+    "prices", "budgets", "goals", "goal_records", "snapshots",
+]
+_command_connection = ContextVar("command_connection", default=None)
+
+
+class BorrowedConnection:
+    """A command owns commit/rollback; nested service calls only borrow its connection."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+    def rollback(self):
+        # Callers that roll back also raise; the command boundary handles the rollback.
+        pass
+
+
+def is_postgres_connection(conn):
+    return isinstance(conn.connection if isinstance(conn, BorrowedConnection) else conn, PostgresConnection)
+
+
+@contextmanager
+def share_command_connection(conn):
+    token = _command_connection.set(conn)
+    try:
+        yield
+    finally:
+        _command_connection.reset(token)
 
 
 class HybridRow(dict):
@@ -30,6 +71,10 @@ class PostgresCursor:
     def __iter__(self):
         for row in self.cursor:
             yield HybridRow(row)
+
+    @property
+    def rowcount(self):
+        return self.cursor.rowcount
 
 
 class PostgresConnection:
@@ -67,11 +112,17 @@ class PostgresConnection:
     def commit(self):
         self.conn.commit()
 
+    def rollback(self):
+        self.conn.rollback()
+
     def close(self):
         self.conn.close()
 
 
 def get_connection():
+    shared = _command_connection.get()
+    if shared is not None:
+        return BorrowedConnection(shared)
     if DATABASE_URL:
         try:
             import psycopg
@@ -87,6 +138,39 @@ def get_connection():
 
 def rows_to_dicts(rows):
     return [dict(row) for row in rows]
+
+
+@contextmanager
+def write_connection():
+    """Serialize read/modify/write on SQLite; callers lock relevant PG rows."""
+    shared = _command_connection.get()
+    if shared is not None:
+        yield BorrowedConnection(shared)
+        return
+    conn = get_connection()
+    try:
+        if not isinstance(conn, PostgresConnection):
+            conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def lock_row(conn, table, row_id):
+    if table not in FINANCIAL_TABLES:
+        raise ValueError("Unknown financial table")
+    suffix = " FOR UPDATE" if is_postgres_connection(conn) else ""
+    return conn.execute(f"SELECT * FROM {table} WHERE id = ?{suffix}", (row_id,)).fetchone()
+
+
+def is_unique_violation(exc):
+    if isinstance(exc, sqlite3.IntegrityError):
+        return "UNIQUE constraint failed" in str(exc)
+    return getattr(exc, "sqlstate", None) == "23505"
 
 
 DEFAULT_CATEGORIES = [
@@ -222,7 +306,134 @@ def ensure_column(conn, table, column, definition):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
-def init_postgres_db(conn):
+class UnresolvedTransactionFxError(RuntimeError):
+    pass
+
+
+def normalize_legacy_transaction_fx(conn):
+    conn.execute(
+        """
+        UPDATE transactions
+        SET currency = (
+            SELECT UPPER(TRIM(accounts.currency))
+            FROM accounts
+            WHERE accounts.id = transactions.account_id
+        )
+        WHERE base_amount IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM accounts
+              WHERE accounts.id = transactions.account_id
+                AND currency IS NOT NULL
+                AND TRIM(currency) != ''
+          )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE transactions
+        SET currency = ?,
+            exchange_rate_to_base = 1,
+            base_amount = amount,
+            fx_status = 'base_currency'
+        WHERE base_amount IS NULL
+          AND account_id IN (
+              SELECT id
+              FROM accounts
+              WHERE UPPER(COALESCE(NULLIF(TRIM(currency), ''), ?)) = ?
+          )
+        """,
+        (BASE_CURRENCY, BASE_CURRENCY, BASE_CURRENCY),
+    )
+    conn.execute(
+        """
+        UPDATE transactions
+        SET fx_status = 'captured'
+        WHERE base_amount IS NOT NULL
+          AND (fx_status IS NULL OR fx_status = 'unresolved')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE transactions
+        SET fx_status = 'unresolved'
+        WHERE base_amount IS NULL
+        """
+    )
+    return conn.execute(
+        "SELECT COUNT(*) AS count FROM transactions WHERE fx_status = 'unresolved'"
+    ).fetchone()["count"]
+
+
+def get_unresolved_transaction_fx(conn):
+    return rows_to_dicts(conn.execute(
+        """
+        SELECT
+            t.id, t.occurred_at, t.amount, t.currency,
+            t.exchange_rate_to_base, a.name AS account_name
+        FROM transactions t
+        LEFT JOIN accounts a ON a.id = t.account_id
+        WHERE t.fx_status = 'unresolved'
+        ORDER BY t.occurred_at, t.id
+        """
+    ).fetchall())
+
+
+def resolve_transaction_fx(conn, rates):
+    for transaction_id, rate in rates.items():
+        normalized_rate = float(rate)
+        if not math.isfinite(normalized_rate) or normalized_rate <= 0:
+            raise ValueError(f"流水 {transaction_id} 的汇率必须大于 0")
+        row = conn.execute(
+            """
+            SELECT id, amount
+            FROM transactions
+            WHERE id = ? AND fx_status = 'unresolved'
+            """,
+            (int(transaction_id),),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"流水 {transaction_id} 不存在或无需迁移")
+        conn.execute(
+            """
+            UPDATE transactions
+            SET exchange_rate_to_base = ?,
+                base_amount = amount * ?,
+                fx_status = 'resolved'
+            WHERE id = ?
+            """,
+            (normalized_rate, normalized_rate, row["id"]),
+        )
+
+
+def finish_database_init(conn, allow_unresolved):
+    # Operational keys stay outside version-1 financial backups.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS financial_commands (
+            command_key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+            response TEXT, invalidated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+    # Existing records keep their actual past balance effect; no silent balance rewrite.
+    ensure_column(conn, "transactions", "balance_applied", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "transactions", "voided_at", "TEXT")
+    ensure_column(conn, "transactions", "void_reason", "TEXT")
+    for field in ("quantity_before", "cost_before", "quantity_after", "cost_after", "settlement_rate"):
+        ensure_column(conn, "investment_trades", field, "DOUBLE PRECISION")
+    for field in ("voided_at", "void_reason", "account_currency"):
+        ensure_column(conn, "investment_trades", field, "TEXT")
+    unresolved_count = normalize_legacy_transaction_fx(conn)
+    conn.commit()
+    conn.close()
+    if unresolved_count and not allow_unresolved:
+        raise UnresolvedTransactionFxError(
+            f"{unresolved_count} 笔历史外币流水缺少发生时汇率。"
+            "请先运行 migrate_transaction_fx.py 导出并补录历史汇率。"
+        )
+
+
+def init_postgres_db(conn, allow_unresolved=False):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             id SERIAL PRIMARY KEY,
@@ -233,18 +444,22 @@ def init_postgres_db(conn):
             balance DOUBLE PRECISION NOT NULL DEFAULT 0,
             cash_available DOUBLE PRECISION NOT NULL DEFAULT 0,
             currency TEXT NOT NULL DEFAULT 'CNY',
+            exchange_rate_to_base DOUBLE PRECISION NOT NULL DEFAULT 1,
             last4 TEXT,
             credit_limit DOUBLE PRECISION DEFAULT 0,
             statement_day INTEGER,
             repayment_day INTEGER,
             is_liability INTEGER DEFAULT 0,
             is_active INTEGER DEFAULT 1,
+            opened_at TEXT,
             created_at TEXT,
             updated_at TEXT
         )
     """)
     ensure_column(conn, "accounts", "owner", "TEXT DEFAULT '冠池'")
     ensure_column(conn, "accounts", "cash_available", "DOUBLE PRECISION NOT NULL DEFAULT 0")
+    ensure_column(conn, "accounts", "exchange_rate_to_base", "DOUBLE PRECISION NOT NULL DEFAULT 1")
+    ensure_column(conn, "accounts", "opened_at", "TEXT")
     conn.execute("UPDATE accounts SET owner = TRIM(institution) WHERE institution IS NOT NULL AND TRIM(institution) != ''")
     conn.execute("UPDATE accounts SET owner = '冠池' WHERE owner IS NULL OR TRIM(owner) = ''")
 
@@ -267,15 +482,25 @@ def init_postgres_db(conn):
             account_id INTEGER NOT NULL,
             category_id INTEGER,
             amount DOUBLE PRECISION NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'CNY',
+            exchange_rate_to_base DOUBLE PRECISION NOT NULL DEFAULT 1,
+            base_amount DOUBLE PRECISION,
+            fx_status TEXT NOT NULL DEFAULT 'captured',
             direction TEXT NOT NULL,
             occurred_at TEXT NOT NULL,
             merchant TEXT,
             note TEXT,
             source TEXT DEFAULT 'manual',
+            reference_id TEXT,
             created_at TEXT,
             updated_at TEXT
         )
     """)
+    ensure_column(conn, "transactions", "currency", "TEXT")
+    ensure_column(conn, "transactions", "exchange_rate_to_base", "DOUBLE PRECISION")
+    ensure_column(conn, "transactions", "base_amount", "DOUBLE PRECISION")
+    ensure_column(conn, "transactions", "fx_status", "TEXT NOT NULL DEFAULT 'unresolved'")
+    ensure_column(conn, "transactions", "reference_id", "TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS holdings (
@@ -289,7 +514,29 @@ def init_postgres_db(conn):
             asset_type TEXT DEFAULT 'stock',
             market TEXT,
             currency TEXT DEFAULT 'CNY',
+            exchange_rate_to_base DOUBLE PRECISION NOT NULL DEFAULT 1,
             updated_at TEXT
+        )
+    """)
+    ensure_column(conn, "holdings", "currency", "TEXT DEFAULT 'CNY'")
+    ensure_column(conn, "holdings", "exchange_rate_to_base", "DOUBLE PRECISION NOT NULL DEFAULT 1")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS investment_trades (
+            id SERIAL PRIMARY KEY,
+            holding_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            trade_type TEXT NOT NULL,
+            quantity DOUBLE PRECISION NOT NULL,
+            price DOUBLE PRECISION NOT NULL,
+            fee DOUBLE PRECISION NOT NULL DEFAULT 0,
+            cash_amount DOUBLE PRECISION NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'CNY',
+            exchange_rate_to_base DOUBLE PRECISION NOT NULL DEFAULT 1,
+            base_amount DOUBLE PRECISION NOT NULL,
+            occurred_at TEXT NOT NULL,
+            note TEXT,
+            created_at TEXT
         )
     """)
 
@@ -357,21 +604,23 @@ def init_postgres_db(conn):
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_date ON snapshots(snapshot_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_month ON transactions(occurred_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_reference ON transactions(reference_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_investment_trades_account_date ON investment_trades(account_id, occurred_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_budgets_month_category ON budgets(month, category_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_budgets_month_category ON budgets(month, category_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_code_date ON prices(code, price_date)")
 
     ensure_default_categories(conn)
 
     if os.environ.get("SEED_DEMO_DATA") == "1":
         seed_data(conn)
-    conn.commit()
-    conn.close()
+    finish_database_init(conn, allow_unresolved)
 
 
-def init_db():
+def init_db(allow_unresolved=False):
     conn = get_connection()
     if DATABASE_URL:
-        init_postgres_db(conn)
+        init_postgres_db(conn, allow_unresolved)
         return
 
     conn.execute("""
@@ -384,18 +633,22 @@ def init_db():
             balance REAL NOT NULL DEFAULT 0,
             cash_available REAL NOT NULL DEFAULT 0,
             currency TEXT NOT NULL DEFAULT 'CNY',
+            exchange_rate_to_base REAL NOT NULL DEFAULT 1,
             last4 TEXT,
             credit_limit REAL DEFAULT 0,
             statement_day INTEGER,
             repayment_day INTEGER,
             is_liability INTEGER DEFAULT 0,
             is_active INTEGER DEFAULT 1,
+            opened_at TEXT,
             created_at TEXT,
             updated_at TEXT
         )
     """)
     ensure_column(conn, "accounts", "owner", "TEXT DEFAULT '冠池'")
     ensure_column(conn, "accounts", "cash_available", "REAL NOT NULL DEFAULT 0")
+    ensure_column(conn, "accounts", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1")
+    ensure_column(conn, "accounts", "opened_at", "TEXT")
     conn.execute("UPDATE accounts SET owner = TRIM(institution) WHERE institution IS NOT NULL AND TRIM(institution) != ''")
     conn.execute("UPDATE accounts SET owner = '冠池' WHERE owner IS NULL OR TRIM(owner) = ''")
 
@@ -418,15 +671,25 @@ def init_db():
             account_id INTEGER NOT NULL,
             category_id INTEGER,
             amount REAL NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'CNY',
+            exchange_rate_to_base REAL NOT NULL DEFAULT 1,
+            base_amount REAL,
+            fx_status TEXT NOT NULL DEFAULT 'captured',
             direction TEXT NOT NULL,
             occurred_at TEXT NOT NULL,
             merchant TEXT,
             note TEXT,
             source TEXT DEFAULT 'manual',
+            reference_id TEXT,
             created_at TEXT,
             updated_at TEXT
         )
     """)
+    ensure_column(conn, "transactions", "currency", "TEXT")
+    ensure_column(conn, "transactions", "exchange_rate_to_base", "REAL")
+    ensure_column(conn, "transactions", "base_amount", "REAL")
+    ensure_column(conn, "transactions", "fx_status", "TEXT NOT NULL DEFAULT 'unresolved'")
+    ensure_column(conn, "transactions", "reference_id", "TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS holdings (
@@ -442,7 +705,27 @@ def init_db():
     ensure_column(conn, "holdings", "asset_type", "TEXT DEFAULT 'stock'")
     ensure_column(conn, "holdings", "market", "TEXT")
     ensure_column(conn, "holdings", "currency", "TEXT DEFAULT 'CNY'")
+    ensure_column(conn, "holdings", "exchange_rate_to_base", "REAL NOT NULL DEFAULT 1")
     ensure_column(conn, "holdings", "updated_at", "TEXT")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS investment_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            holding_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            trade_type TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            price REAL NOT NULL,
+            fee REAL NOT NULL DEFAULT 0,
+            cash_amount REAL NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'CNY',
+            exchange_rate_to_base REAL NOT NULL DEFAULT 1,
+            base_amount REAL NOT NULL,
+            occurred_at TEXT NOT NULL,
+            note TEXT,
+            created_at TEXT
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS prices (
@@ -507,15 +790,17 @@ def init_db():
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_date ON snapshots(snapshot_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_month ON transactions(occurred_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transactions_reference ON transactions(reference_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_investment_trades_account_date ON investment_trades(account_id, occurred_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_budgets_month_category ON budgets(month, category_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_budgets_month_category ON budgets(month, category_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_code_date ON prices(code, price_date)")
 
     ensure_default_categories(conn)
 
     if os.environ.get("SEED_DEMO_DATA") == "1":
         seed_data(conn)
-    conn.commit()
-    conn.close()
+    finish_database_init(conn, allow_unresolved)
 
 
 def seed_data(conn):
@@ -583,13 +868,15 @@ def seed_data(conn):
         conn.executemany(
             """
             INSERT INTO transactions
-            (account_id, category_id, amount, direction, occurred_at, merchant, note, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (account_id, category_id, amount, currency, exchange_rate_to_base, base_amount,
+             fx_status, direction, occurred_at, merchant, note, created_at, updated_at)
+            VALUES (?, ?, ?, 'CNY', 1, ?, 'captured', ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     account_ids[account_name],
                     category_ids[category_name],
+                    amount,
                     amount,
                     direction,
                     occurred_at.isoformat(),

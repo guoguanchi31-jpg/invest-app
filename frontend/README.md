@@ -1,16 +1,35 @@
-# React + Vite
+# Invest frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React + Vite frontend packaged for iOS and Android with Capacitor.
 
-Currently, two official plugins are available:
+## Web development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+npm install
+npm run dev
+```
 
-## React Compiler
+The development server uses `http://127.0.0.1:8000` when
+`VITE_API_URL` is not set.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Mobile configuration
 
-## Expanding the Oxlint configuration
+Create `.env.local` from `.env.example` and set `VITE_API_URL` to the
+public HTTPS URL of the FastAPI backend. A native build intentionally
+has no localhost fallback because localhost points to the phone itself.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+```bash
+cp .env.example .env.local
+npm run mobile:sync
+```
+
+Open a native project after synchronization:
+
+```bash
+npm run mobile:open:ios
+npm run mobile:open:android
+```
+
+The initial application identifier is `com.investapp.mobile`. Change it
+before store submission if a different permanent bundle identifier is
+required.
