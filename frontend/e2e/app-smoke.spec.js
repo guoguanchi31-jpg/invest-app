@@ -314,7 +314,7 @@ test("loads the dashboard and navigates to the ledger", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "测试家庭财务总览" })).toBeVisible();
   const icpLink = page.getByRole("link", { name: "京ICP备2026067668号" });
   await expect(icpLink).toHaveAttribute("href", "https://beian.miit.gov.cn/");
-  await expect(icpLink.locator("svg")).toHaveClass(/site-footer-record-icon/);
+  await expect(icpLink.locator("img")).toHaveAttribute("src", "/beian-icp.png");
   const publicSecurityLink = page.getByRole("link", {
     name: PUBLIC_SECURITY_RECORD_NUMBER,
   });
