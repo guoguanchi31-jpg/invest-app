@@ -312,8 +312,9 @@ test.beforeEach(async ({ page }) => {
 test("loads the dashboard and navigates to the ledger", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "测试家庭财务总览" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "京ICP备2026067668号" }))
-    .toHaveAttribute("href", "https://beian.miit.gov.cn/");
+  const icpLink = page.getByRole("link", { name: "京ICP备2026067668号" });
+  await expect(icpLink).toHaveAttribute("href", "https://beian.miit.gov.cn/");
+  await expect(icpLink.locator("svg")).toHaveClass(/site-footer-record-icon/);
   const publicSecurityLink = page.getByRole("link", {
     name: PUBLIC_SECURITY_RECORD_NUMBER,
   });
@@ -327,6 +328,8 @@ test("loads the dashboard and navigates to the ledger", async ({ page }) => {
       .map((link) => link.getBoundingClientRect());
     const [icpRect, publicSecurityRect] = linkRects;
     const icon = element.querySelector(".site-footer-police-record img");
+    const iconRects = [...element.querySelectorAll(".site-footer-record-icon")]
+      .map((recordIcon) => recordIcon.getBoundingClientRect());
     const linksOverlap = !(
       icpRect.right <= publicSecurityRect.left
       || publicSecurityRect.right <= icpRect.left
@@ -335,12 +338,14 @@ test("loads the dashboard and navigates to the ledger", async ({ page }) => {
     );
     return {
       iconLoaded: icon.complete && icon.naturalWidth === 20 && icon.naturalHeight === 20,
+      iconsSized: iconRects.every((rect) => rect.width === 20 && rect.height === 20),
       linksOverlap,
       overflows: element.scrollWidth > element.clientWidth,
     };
   });
   expect(filingLayout).toEqual({
     iconLoaded: true,
+    iconsSized: true,
     linksOverlap: false,
     overflows: false,
   });

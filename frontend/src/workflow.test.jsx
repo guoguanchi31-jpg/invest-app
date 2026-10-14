@@ -334,6 +334,7 @@ it("shows the application preview before login without requesting protected data
   const icpLink = screen.getByRole("link", { name: "京ICP备2026067668号" });
   expect(icpLink.getAttribute("href")).toBe("https://beian.miit.gov.cn/");
   expect(icpLink.getAttribute("target")).toBe("_blank");
+  expect(icpLink.querySelector("svg")?.classList.contains("site-footer-record-icon")).toBe(true);
   const publicSecurityLink = screen.getByRole("link", {
     name: PUBLIC_SECURITY_RECORD_NUMBER,
   });

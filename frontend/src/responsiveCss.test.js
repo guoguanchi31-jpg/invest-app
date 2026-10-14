@@ -563,5 +563,8 @@ describe("responsive CSS ownership", () => {
     expect(css).toMatch(
       /\.site-footer a\s*\{[^}]*display:\s*inline-flex;[^}]*white-space:\s*nowrap/,
     );
+    expect(css).toMatch(
+      /\.site-footer-record-icon\s*\{[^}]*width:\s*20px;[^}]*height:\s*20px;[^}]*flex:\s*0 0 20px/,
+    );
   });
 });
