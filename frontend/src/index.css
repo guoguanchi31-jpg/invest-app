@@ -5664,19 +5664,10 @@ select {
 }
 
 .ledger-overview-balance-head {
-  display: flex;
-  min-width: 0;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 18px;
-}
-
-.ledger-overview-balance-head > div {
   min-width: 0;
 }
 
 .ledger-overview-balance-head span,
-.ledger-overview-balance-head p,
 .ledger-overview-cashflow span,
 .ledger-overview-stat-grid span,
 .ledger-overview-stat-grid small {
@@ -5693,16 +5684,15 @@ select {
   white-space: nowrap;
 }
 
-.ledger-overview-balance-head p {
-  display: grid;
-  flex: 0 0 auto;
-  gap: 5px;
-  margin: 0;
+.ledger-overview-previous {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 10px 0 0;
   font-size: 12px;
-  text-align: right;
 }
 
-.ledger-overview-balance-head p b {
+.ledger-overview-previous b {
   font-size: 14px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -6007,17 +5997,6 @@ select {
 
   .ledger-overview-controls > label {
     min-width: 0;
-  }
-
-  .ledger-overview-balance-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .ledger-overview-balance-head p {
-    grid-template-columns: auto auto;
-    align-items: baseline;
-    text-align: left;
   }
 
   .ledger-overview-balance-head .metric-value {

@@ -33,8 +33,13 @@ describe("responsive CSS ownership", () => {
     );
     expect(overview.match(/<label className="filter-field">/g)).toHaveLength(2);
     expect(overview).toContain('className="segmented ledger-overview-mode"');
+    expect(overview).toContain('<p className="ledger-overview-previous">');
+    expect(overview).not.toMatch(/<button[^>]*>\s*上月结余/);
     expect(css).toMatch(
       /\.ledger-overview-mode\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/,
+    );
+    expect(css).toMatch(
+      /\.ledger-overview-previous\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*baseline/,
     );
     expect(css).toMatch(
       /\.ledger-overview-controls \.ledger-overview-mode button\.active\s*\{[^}]*background:\s*var\(--green\);[^}]*color:\s*#ffffff/,

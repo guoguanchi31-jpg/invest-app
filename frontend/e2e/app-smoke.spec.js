@@ -355,7 +355,7 @@ test("loads the dashboard and navigates to the ledger", async ({ page }) => {
   expect(await page.evaluate(
     () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
   )).toBe(true);
-  await page.getByRole("button", { name: "账本" }).click();
+  await page.getByRole("button", { name: "账本", exact: true }).click();
   await expect(page.getByRole("heading", { name: "流水明细" })).toBeVisible();
   await expect(page.locator("button:visible").filter({ hasText: /^记一笔$/ }).first()).toBeVisible();
   expect(await page.evaluate(
@@ -457,7 +457,7 @@ test("runs guest interactions locally without calling the real API", async ({ pa
   await transaction.getByRole("button", { name: "完成" }).click();
   await expect(transaction).toBeHidden();
 
-  await page.getByRole("button", { name: "账本" }).click();
+  await page.getByRole("button", { name: "账本", exact: true }).click();
   await expect(page.getByText("游客咖啡", { exact: true })).toBeVisible();
   const guestActions = page.getByRole("group", { name: "账本操作" });
   await expect(guestActions.getByRole("button")).toHaveText(["转账", "导出流水"]);
@@ -1088,7 +1088,7 @@ test("keeps the monthly ledger overview contained across mobile tablet and deskt
   for (const width of [320, 390, 834, 1440]) {
     await page.setViewportSize({ width, height: width < 600 ? 844 : 1000 });
     await page.goto("/");
-    await page.getByRole("button", { name: "账本" }).click();
+    await page.getByRole("button", { name: "账本", exact: true }).click();
     await page.getByRole("tab", { name: "月度概览" }).click();
     const overview = page.locator(".ledger-overview");
     await expect(overview.getByRole("heading", { name: /2026年10月/ })).toBeVisible();
@@ -1117,6 +1117,11 @@ test("keeps the monthly ledger overview contained across mobile tablet and deskt
       const modeControlBox = modeControl.getBoundingClientRect();
       const modeButtons = [...modeControl.querySelectorAll("button")];
       const modeButtonBoxes = modeButtons.map((button) => button.getBoundingClientRect());
+      const balanceHead = element.querySelector(".ledger-overview-balance-head");
+      const currentBalanceBox = balanceHead.querySelector(".metric-value").getBoundingClientRect();
+      const previousBalance = balanceHead.querySelector(".ledger-overview-previous");
+      const previousBalanceBox = previousBalance.getBoundingClientRect();
+      const balanceHeadBox = balanceHead.getBoundingClientRect();
       return {
         documentContained: document.documentElement.scrollWidth
           <= document.documentElement.clientWidth,
@@ -1150,6 +1155,13 @@ test("keeps the monthly ledger overview contained across mobile tablet and deskt
           / modeControlBox.width,
         modeActiveDistinct: getComputedStyle(modeButtons[0]).backgroundColor
           !== getComputedStyle(modeButtons[1]).backgroundColor,
+        previousBalanceGrouped: previousBalance.parentElement === balanceHead
+          && previousBalanceBox.top >= currentBalanceBox.bottom - 0.5
+          && previousBalanceBox.left >= balanceHeadBox.left - 0.5
+          && previousBalanceBox.right <= balanceHeadBox.right + 0.5,
+        previousBalanceReadOnly: previousBalance.tagName === "P"
+          && previousBalance.tabIndex === -1
+          && !previousBalance.querySelector("button, a, [role='button']"),
         gridColumns,
       };
     });
@@ -1165,6 +1177,8 @@ test("keeps the monthly ledger overview contained across mobile tablet and deskt
     expect(layout.modeEqualWidths, `${width}px overview mode widths`).toBeLessThanOrEqual(0.5);
     expect(layout.modeCoverage, `${width}px overview mode coverage`).toBeGreaterThan(0.9);
     expect(layout.modeActiveDistinct, `${width}px overview active mode`).toBe(true);
+    expect(layout.previousBalanceGrouped, `${width}px previous balance grouping`).toBe(true);
+    expect(layout.previousBalanceReadOnly, `${width}px previous balance semantics`).toBe(true);
     if (width <= 900) {
       expect(layout.actionsAfterTitle, `${width}px topbar action row`).toBe(true);
     }

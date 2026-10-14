@@ -138,14 +138,12 @@ export default function LedgerMonthlyOverview({
         <>
           <article className="panel ledger-overview-balance">
             <div className="ledger-overview-balance-head">
-              <div>
-                <span>本月结余</span>
-                <MetricValue className={summary.balance < 0 ? "negative" : "positive"}>
-                  {formatMoney(summary.balance || 0)}
-                </MetricValue>
-              </div>
-              <p>
-                上月结余
+              <span>本月结余</span>
+              <MetricValue className={summary.balance < 0 ? "negative" : "positive"}>
+                {formatMoney(summary.balance || 0)}
+              </MetricValue>
+              <p className="ledger-overview-previous">
+                <span>上月结余</span>
                 <b className={summary.previous_balance < 0 ? "negative" : "positive"}>
                   {formatMoney(summary.previous_balance || 0)}
                 </b>
