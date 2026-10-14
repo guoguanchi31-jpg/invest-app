@@ -22,7 +22,7 @@ case "${ID}" in
 esac
 
 apt-get update
-apt-get install -y ca-certificates curl gnupg openssl
+apt-get install -y ca-certificates curl gnupg openssl python3
 
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL "https://download.docker.com/linux/${ID}/gpg" \

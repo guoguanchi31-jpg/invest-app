@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from services import get_dashboard_summary
+from queries.finance import get_dashboard_summary
 
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])

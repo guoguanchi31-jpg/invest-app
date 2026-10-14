@@ -1,7 +1,6 @@
 import csv
 import asyncio
 import json
-import re
 from pathlib import Path
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor
@@ -12,20 +11,32 @@ from unittest.mock import patch
 
 from fastapi import Depends, FastAPI, HTTPException
 import database
-from routers.accounts import create_account, reverse_transfer, transfer_between_accounts
-from routers.investments import create_investment_trade, reverse_investment_trade, update_holding
+from routers.accounts import (
+    adjust_account_balance,
+    create_account,
+    reverse_transfer,
+    transfer_between_accounts,
+)
+from routers.investments import (
+    create_investment_trade,
+    list_investment_trades,
+    reverse_investment_trade,
+    update_holding,
+)
 from routers.transactions import (
     create_transaction, delete_transaction, export_ledger, import_statement_transactions,
-    preview_statement_import, update_transaction,
+    list_ledger, preview_statement_import, update_transaction,
     query_ledger,
 )
 from routers.warehouse import download_data_backup, preview_restore, restore_backup, RestoreRequest
 from schemas import (
-    AccountCreate, HoldingCreate, InvestmentTradeCreate, ReversalCreate, StatementImportPayload,
-    StatementImportRow, TransactionCreate, TransferCreate,
+    AccountCreate, BalanceAdjustmentCreate, HoldingCreate, InvestmentTradeCreate,
+    ReversalCreate, StatementImportPayload, StatementImportRow, TransactionCreate,
+    TransferCreate,
 )
 from tests import test_finance_regressions as finance_tests
 from services import get_accounts_overview, get_expense_analysis
+from tenancy import use_auth_context
 
 
 class WorkflowRegressions(unittest.TestCase):
@@ -123,11 +134,12 @@ class WorkflowRegressions(unittest.TestCase):
         start = Barrier(2)
         def reverse():
             start.wait()
-            try:
-                reverse_transfer(ref, ReversalCreate(reason="录错"))
-                return 200
-            except HTTPException as exc:
-                return exc.status_code
+            with use_auth_context(self.auth_context):
+                try:
+                    reverse_transfer(ref, ReversalCreate(reason="录错"))
+                    return 200
+                except HTTPException as exc:
+                    return exc.status_code
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(reverse) for _ in range(2)]
             self.assertEqual(sorted(f.result() for f in futures), [200, 409])
@@ -169,6 +181,39 @@ class WorkflowRegressions(unittest.TestCase):
         with self.assertRaises(HTTPException):
             reverse_investment_trade(first["id"], ReversalCreate(reason="再次撤销"))
 
+    def test_paginated_trades_use_global_latest_trade_for_reversal(self):
+        account = self.add_account(
+            "分页投资",
+            account_type="investment",
+            cash_available=10000,
+        )
+        first = create_investment_trade(self.new_trade(
+            account,
+            quantity=1,
+            price=1,
+        ))
+        for _ in range(50):
+            create_investment_trade(InvestmentTradeCreate(
+                holding_id=first["holding_id"],
+                trade_type="buy",
+                quantity=1,
+                price=1,
+                occurred_at="2026-09-28",
+            ))
+
+        first_page = list_investment_trades(page=1, page_size=50)
+        second_page = list_investment_trades(page=2, page_size=50)
+
+        self.assertEqual(first_page["total"], 51)
+        self.assertTrue(first_page["items"][0]["can_reverse"])
+        self.assertFalse(first_page["items"][1]["can_reverse"])
+        self.assertEqual(second_page["items"][0]["id"], first["id"])
+        self.assertFalse(second_page["items"][0]["can_reverse"])
+        self.assertEqual(
+            second_page["items"][0]["reverse_disabled_reason"],
+            "请先撤销同一持仓最近一笔交易",
+        )
+
     def test_backup_restore_preview_validation_and_roundtrip(self):
         account = self.opening_account()
         saved = json.loads(download_data_backup().body)
@@ -177,10 +222,20 @@ class WorkflowRegressions(unittest.TestCase):
         result = restore_backup(RestoreRequest(
             backup=saved, expected_fingerprint=preview["expected_fingerprint"], confirm_replace=True,
         ))
+        account = result["id_mapping"]["accounts"][account]
         self.assertEqual(self.get_account(account)["balance"], 1000)
         self.assertEqual(result["counts"]["transactions"], 1)
+        self.assertEqual(result["snapshot"]["net_worth"], 1000)
+        conn = database.get_connection()
+        family_id = conn.execute("SELECT id FROM families ORDER BY id LIMIT 1").fetchone()["id"]
+        conn.close()
         from pathlib import Path
-        self.assertTrue((Path(database.DB_DIR) / "backups" / result["recovery_backup"]).is_file())
+        self.assertTrue((
+            Path(database.DB_DIR)
+            / "backups"
+            / f"family-{family_id}"
+            / result["recovery_backup"]
+        ).is_file())
         invalid = json.loads(json.dumps(saved))
         invalid["data"]["transactions"][0]["account_id"] = 999
         with self.assertRaises(HTTPException):
@@ -225,6 +280,87 @@ class WorkflowRegressions(unittest.TestCase):
         self.assertEqual(self.get_account(source)["balance"], 1000)
         self.assertEqual(self.get_account(target)["balance"], 0)
 
+    def test_ledger_hides_audit_records_by_default_but_keeps_them_queryable(self):
+        source = self.opening_account()
+        target = self.add_account("收款", balance=0)
+        create_transaction(TransactionCreate(
+            account_id=source,
+            amount=10,
+            direction="expense",
+            occurred_at="2026-09-28",
+        ))
+        adjust_account_balance(source, BalanceAdjustmentCreate(
+            actual_balance=1200,
+            occurred_at="2026-09-27",
+            reason="月末核对",
+        ))
+        transfer_between_accounts(TransferCreate(
+            from_account_id=source,
+            to_account_id=target,
+            amount=100,
+            occurred_at="2026-09-26",
+        ))
+        voided_reference = transfer_between_accounts(TransferCreate(
+            from_account_id=source,
+            to_account_id=target,
+            amount=50,
+            occurred_at="2026-09-25",
+        ))["reference_id"]
+        reverse_transfer(voided_reference, ReversalCreate(reason="录入错误"))
+
+        effective = list_ledger(page=1, page_size=30)
+        self.assertEqual(effective["total"], 2)
+        self.assertEqual(
+            {item["source"] for item in effective["items"]},
+            {"manual", "transfer"},
+        )
+        self.assertTrue(all(not item.get("voided_at") for item in effective["items"]))
+
+        all_records = list_ledger(
+            page=1,
+            page_size=30,
+            record_scope="all_records",
+        )
+        self.assertEqual(all_records["total"], 5)
+        self.assertIn("adjustment", {item["source"] for item in all_records["items"]})
+        self.assertTrue(any(item.get("voided_at") for item in all_records["items"]))
+
+        voided = list_ledger(page=1, page_size=30, record_scope="voided")
+        self.assertEqual(voided["total"], 1)
+        self.assertTrue(voided["items"][0]["voided_at"])
+
+    def test_ledger_and_trade_history_support_server_pagination(self):
+        account = self.add_account("分页账户", balance=1000)
+        for index in range(35):
+            create_transaction(TransactionCreate(
+                account_id=account,
+                amount=10,
+                direction="expense",
+                occurred_at="2026-09-28",
+                note=f"分页{index}",
+            ))
+        first = query_ledger(page=1, page_size=30)
+        second = query_ledger(page=2, page_size=30)
+        self.assertEqual((first["total"], len(first["items"])), (35, 30))
+        self.assertEqual(len(second["items"]), 5)
+        self.assertEqual(first["summary"]["expense"], 350)
+
+        investment = self.add_account(
+            "分页投资",
+            account_type="investment",
+            cash_available=1000,
+        )
+        first_trade = create_investment_trade(self.new_trade(investment))
+        create_investment_trade(InvestmentTradeCreate(
+            holding_id=first_trade["holding_id"],
+            trade_type="buy",
+            quantity=1,
+            price=10,
+            occurred_at="2026-09-28",
+        ))
+        trades = list_investment_trades(page=1, page_size=1)
+        self.assertEqual((trades["total"], len(trades["items"])), (2, 1))
+
     def test_concurrent_trade_reversal_uses_original_cash_after_fx_change(self):
         account = self.add_account("投资", account_type="investment", cash_available=1000, currency="USD", exchange_rate=7)
         trade = create_investment_trade(self.new_trade(account).model_copy(update={"settlement_rate": 1 / 7}))
@@ -235,11 +371,12 @@ class WorkflowRegressions(unittest.TestCase):
         start = Barrier(2)
         def reverse():
             start.wait()
-            try:
-                reverse_investment_trade(trade["id"], ReversalCreate(reason="录错"))
-                return 200
-            except HTTPException as exc:
-                return exc.status_code
+            with use_auth_context(self.auth_context):
+                try:
+                    reverse_investment_trade(trade["id"], ReversalCreate(reason="录错"))
+                    return 200
+                except HTTPException as exc:
+                    return exc.status_code
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(reverse) for _ in range(2)]
             self.assertEqual(sorted(f.result() for f in futures), [200, 409])
@@ -262,6 +399,7 @@ class WorkflowRegressions(unittest.TestCase):
         source = database.get_connection()
         columns = {table: migration.sqlite_columns(source, table) for table in migration.TABLES}
         source.close()
+        source_bytes = Path(database.DB).read_bytes()
 
         class Target:
             def __init__(self, mismatch=False):
@@ -295,6 +433,7 @@ class WorkflowRegressions(unittest.TestCase):
             target = Target()
             with patch.object(migration.psycopg, "connect", return_value=target), patch("builtins.print"):
                 counts = migration.migrate(database.DB, replace=False)
+            self.assertEqual(Path(database.DB).read_bytes(), source_bytes)
             self.assertEqual(counts["investment_trades"], 1)
             self.assertEqual(len(target.data["investment_trades"]), 1)
             self.assertFalse(target.rolled_back)
@@ -304,12 +443,32 @@ class WorkflowRegressions(unittest.TestCase):
                     migration.migrate(database.DB, replace=False)
             self.assertTrue(mismatch.rolled_back)
 
-    def test_nginx_whitelist_routes_ledger_and_export_to_backend(self):
+    def test_migration_snapshot_includes_committed_wal_records(self):
+        import migrate_sqlite_to_postgres as migration
+
+        source = sqlite3.connect(database.DB)
+        try:
+            source.execute("PRAGMA journal_mode=WAL")
+            source.execute("PRAGMA wal_autocheckpoint=0")
+            source.execute("CREATE TABLE migration_wal_marker(value TEXT NOT NULL)")
+            source.execute("INSERT INTO migration_wal_marker(value) VALUES ('committed')")
+            source.commit()
+            self.assertTrue(Path(f"{database.DB}-wal").is_file())
+
+            with migration.prepared_sqlite_copy(Path(database.DB)) as prepared:
+                with sqlite3.connect(prepared) as snapshot:
+                    marker = snapshot.execute(
+                        "SELECT value FROM migration_wal_marker"
+                    ).fetchone()
+            self.assertEqual(marker, ("committed",))
+        finally:
+            source.close()
+
+    def test_nginx_routes_non_static_paths_to_backend_without_a_route_whitelist(self):
         config = (Path(__file__).resolve().parents[2] / "deploy/nginx/snippets/app-locations.conf").read_text()
-        pattern = re.search(r"location ~ (\S+) \{", config).group(1)
-        for path in ("/ledger", "/ledger/export", "/warehouse/restore", "/investments/trades/1/reverse"):
-            self.assertIsNotNone(re.search(pattern, path), path)
-        self.assertIsNone(re.search(pattern, "/ledger-page"))
+        self.assertIn("location @backend", config)
+        self.assertIn("try_files $uri $uri/ @backend;", config)
+        self.assertNotIn("location ~ ^/(login|auth|family", config)
 
     def test_authenticated_api_schemas_new_buy_reversal_and_restore(self):
         from routers import auth, investments, transactions, warehouse
@@ -317,7 +476,7 @@ class WorkflowRegressions(unittest.TestCase):
         for router in (investments.router, transactions.router, warehouse.router):
             app.include_router(router, dependencies=[Depends(auth.require_auth)])
         account = self.add_account("投资", account_type="investment", cash_available=1000)
-        token = auth.create_access_token()
+        token = auth.create_access_token_for_username("admin")
 
         async def request(method, path, payload=None, authenticated=True):
             body = json.dumps(payload).encode() if payload is not None else b""
@@ -339,7 +498,11 @@ class WorkflowRegressions(unittest.TestCase):
 
         async def scenario():
             self.assertEqual((await request("GET", "/ledger", authenticated=False))[0], 401)
-            status, trade = await request("POST", "/investments/trades", self.new_trade(account).model_dump())
+            status, trade = await request(
+                "POST",
+                "/investments/trades",
+                self.new_trade(account).model_dump(mode="json"),
+            )
             self.assertEqual(status, 200)
             status, saved = await request("GET", "/warehouse/backup")
             self.assertEqual(status, 200)
@@ -349,8 +512,9 @@ class WorkflowRegressions(unittest.TestCase):
             self.assertEqual(status, 200)
             payload = {"backup": saved, "expected_fingerprint": preview["expected_fingerprint"]}
             self.assertEqual((await request("POST", "/warehouse/restore", payload))[0], 409)
-            self.assertEqual((await request("POST", "/warehouse/restore", {**payload, "confirm_replace": True}))[0], 200)
-            self.assertAlmostEqual(self.get_account(account)["cash_available"], 899)
+            status, restored = await request("POST", "/warehouse/restore", {**payload, "confirm_replace": True})
+            self.assertEqual(status, 200)
+            self.assertAlmostEqual(self.get_account(restored["id_mapping"]["accounts"][str(account)])["cash_available"], 899)
         asyncio.run(scenario())
 
 

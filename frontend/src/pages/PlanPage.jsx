@@ -1,25 +1,38 @@
 import BudgetPage from "./BudgetPage";
 import GoalsPage from "./GoalsPage";
+import SegmentedTabs from "../components/SegmentedTabs";
+
+const planTabs = [
+  { value: "budget", label: "月度预算" },
+  { value: "goals", label: "储蓄目标" },
+];
 
 export default function PlanPage({ view }) {
-  const { openAction, planSection, setPlanSection } = view;
+  const { canManagePlans, openAction, planSection, setPlanSection } = view;
 
   return (
     <>
       <div className="section-toolbar">
-        <div className="section-tabs" role="tablist" aria-label="计划视图">
-          <button type="button" className={planSection === "budget" ? "active" : ""} onClick={() => setPlanSection("budget")}>
-            月度预算
+        <SegmentedTabs
+          ariaLabel="计划视图"
+          idPrefix="plan"
+          onChange={setPlanSection}
+          options={planTabs}
+          value={planSection}
+        />
+        {canManagePlans && (
+          <button type="button" className="filter-button primary" onClick={() => openAction(planSection === "budget" ? "budget" : "goal")}>
+            {planSection === "budget" ? "设置预算" : "创建目标"}
           </button>
-          <button type="button" className={planSection === "goals" ? "active" : ""} onClick={() => setPlanSection("goals")}>
-            储蓄目标
-          </button>
-        </div>
-        <button type="button" className="filter-button primary" onClick={() => openAction(planSection === "budget" ? "budget" : "goal")}>
-          {planSection === "budget" ? "设置预算" : "创建目标"}
-        </button>
+        )}
       </div>
-      {planSection === "budget" ? <BudgetPage view={view} /> : <GoalsPage view={view} />}
+      <div
+        id={`plan-panel-${planSection}`}
+        role="tabpanel"
+        aria-labelledby={`plan-tab-${planSection}`}
+      >
+        {planSection === "budget" ? <BudgetPage view={view} /> : <GoalsPage view={view} />}
+      </div>
     </>
   );
 }

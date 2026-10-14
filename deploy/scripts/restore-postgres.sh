@@ -17,19 +17,35 @@ if [[ ! -f "${BACKUP_FILE}" ]]; then
   exit 1
 fi
 
+# Reject truncated input before stopping the application.
+gzip -t "${BACKUP_FILE}"
+
+# Pin the selected archive: the pre-restore backup may prune old files.
+umask 077
+mkdir -p "${ROOT_DIR}/backups"
+RESTORE_SOURCE="$(mktemp "${ROOT_DIR}/backups/.restore-XXXXXX")"
+RESTART_REQUIRED=0
+cleanup() {
+  local result=$?
+  trap - EXIT
+  rm -f "${RESTORE_SOURCE}"
+  if [[ "${RESTART_REQUIRED}" == 1 ]]; then
+    "${COMPOSE[@]}" up -d --wait backend web || result=1
+  fi
+  exit "${result}"
+}
+trap cleanup EXIT
+cp "${BACKUP_FILE}" "${RESTORE_SOURCE}"
+gzip -t "${RESTORE_SOURCE}"
+
 "${ROOT_DIR}/deploy/scripts/backup-postgres.sh"
+RESTART_REQUIRED=1
 "${COMPOSE[@]}" stop web backend
 
-restart_app() {
-  "${COMPOSE[@]}" up -d --wait backend web
-}
-trap restart_app EXIT
-
-gzip -dc "${BACKUP_FILE}" \
+gzip -dc "${RESTORE_SOURCE}" \
   | "${COMPOSE[@]}" exec -T db sh -c \
-      'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" "$POSTGRES_DB"'
+      'psql --single-transaction -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" "$POSTGRES_DB"'
 
-restart_app
-trap - EXIT
-
+"${COMPOSE[@]}" up -d --wait backend web
+RESTART_REQUIRED=0
 echo "Restored ${BACKUP_FILE}"

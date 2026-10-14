@@ -16,6 +16,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
 import database
+from routers import auth
 from routers.accounts import (
     adjust_account_balance,
     create_account,
@@ -23,7 +24,7 @@ from routers.accounts import (
     transfer_between_accounts,
     update_account,
 )
-from routers.budgets import batch_update_budgets, copy_monthly_budget, update_budget
+from routers.budgets import copy_monthly_budget, create_or_update_budget
 from routers.goals import (
     create_goal,
     create_goal_record,
@@ -42,15 +43,17 @@ from routers.transactions import (
 from routers.warehouse import download_data_backup
 from schemas import (
     AccountCreate,
+    BusinessMonth,
     BalanceAdjustmentCreate,
-    BudgetBatchItem,
-    BudgetBatchUpdate,
+    BudgetCategoryAllocation,
     BudgetCopyCreate,
     BudgetCreate,
     GoalCreate,
+    GoalMemberAllocation,
     GoalRecordCreate,
     GoalStatusUpdate,
     InvestmentTradeCreate,
+    MemberAmountAllocation,
     StatementImportPayload,
     StatementImportRow,
     TransactionCreate,
@@ -63,11 +66,14 @@ from services import (
     get_budget_monthly,
     get_dashboard_summary,
     get_expense_analysis,
+    get_goals_overview,
     get_income_analysis,
     get_investment_summary,
+    get_ledger_monthly_overview,
     get_snapshot_trend,
     get_warehouse_overview,
 )
+from tenancy import use_auth_context
 
 
 class FinanceRegressionTests(unittest.TestCase):
@@ -77,9 +83,20 @@ class FinanceRegressionTests(unittest.TestCase):
         database.DB_DIR = self.temp_dir.name
         database.DB = os.path.join(self.temp_dir.name, "invest.db")
         database.init_db()
+        self.auth_context = auth.context_from_token(
+            auth.create_access_token_for_username("admin"),
+            "family",
+        )
+        self.auth_context_manager = use_auth_context(self.auth_context)
+        self.auth_context_manager.__enter__()
 
     def tearDown(self):
+        self.auth_context_manager.__exit__(None, None, None)
         self.temp_dir.cleanup()
+
+    def run_as_current_user(self, operation):
+        with use_auth_context(self.auth_context):
+            return operation()
 
     def add_account(
         self,
@@ -119,6 +136,47 @@ class FinanceRegressionTests(unittest.TestCase):
         row = dict(conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone())
         conn.close()
         return row
+
+    def owner_member_id(self):
+        conn = database.get_connection()
+        member_id = conn.execute(
+            "SELECT id FROM family_members WHERE role = 'owner' ORDER BY id LIMIT 1"
+        ).fetchone()["id"]
+        conn.close()
+        return member_id
+
+    def save_budget(self, month, category_id, amount):
+        return create_or_update_budget(BudgetCreate(
+            month=month,
+            total_amount=amount,
+            categories=[
+                BudgetCategoryAllocation(
+                    category_id=category_id,
+                    amount=amount,
+                    member_allocations=[
+                        MemberAmountAllocation(
+                            member_id=self.owner_member_id(),
+                            amount=amount,
+                        ),
+                    ],
+                ),
+            ],
+        ))
+
+    def goal_payload(self, name, target_amount, current_amount=0, monthly_saving=0):
+        return GoalCreate(
+            name=name,
+            target_amount=target_amount,
+            monthly_saving=monthly_saving,
+            allocations=[
+                GoalMemberAllocation(
+                    member_id=self.owner_member_id(),
+                    target_amount=target_amount,
+                    current_amount=current_amount,
+                    monthly_saving=monthly_saving,
+                ),
+            ],
+        )
 
     def test_transfer_to_investment_account_preserves_total_assets(self):
         bank_id = self.add_account("银行", balance=1000)
@@ -170,15 +228,16 @@ class FinanceRegressionTests(unittest.TestCase):
 
     def test_foreign_currency_holding_is_converted_to_base_currency(self):
         investment_id = self.add_account("投资", account_type="investment")
+        account = self.get_account(investment_id)
         conn = database.get_connection()
         conn.execute(
             """
             INSERT INTO holdings
-            (name, code, buy_price, quantity, current_price, account_id, asset_type,
-             market, currency, exchange_rate_to_base, updated_at)
-            VALUES ('US Stock', 'TEST', 8, 10, 10, ?, 'stock', 'us', 'USD', 7, '2026-09-23')
+            (family_id, member_id, name, code, buy_price, quantity, current_price,
+             account_id, asset_type, market, currency, exchange_rate_to_base, updated_at)
+            VALUES (?, ?, 'US Stock', 'TEST', 8, 10, 10, ?, 'stock', 'us', 'USD', 7, '2026-09-23')
             """,
-            (investment_id,),
+            (account["family_id"], account["member_id"], investment_id),
         )
         conn.commit()
         conn.close()
@@ -234,6 +293,22 @@ class FinanceRegressionTests(unittest.TestCase):
         self.assertEqual(self.get_account(source_id)["balance"], 1000)
         self.assertEqual(self.get_account(target_id)["balance"], 500)
 
+    def test_dashboard_returns_seven_most_recent_transactions(self):
+        account_id = self.add_account("日常账户", balance=10000)
+        for day in range(1, 10):
+            create_transaction(TransactionCreate(
+                account_id=account_id,
+                amount=day,
+                direction="expense",
+                occurred_at=f"2026-09-{day:02d}",
+            ))
+
+        recent = get_dashboard_summary("2026-09")["recent_transactions"]
+
+        self.assertEqual(len(recent), 7)
+        self.assertEqual(recent[0]["occurred_at"], "2026-09-09")
+        self.assertEqual(recent[-1]["occurred_at"], "2026-09-03")
+
     def test_transfer_does_not_pollute_income_or_expense_statistics(self):
         source_id = self.add_account("转出账户", balance=1000)
         target_id = self.add_account("转入账户", balance=500)
@@ -276,16 +351,9 @@ class FinanceRegressionTests(unittest.TestCase):
                 (account_id, expense_category_id, 900, 900, "expense", "2026-10-10"),
             ],
         )
-        conn.execute(
-            """
-            INSERT INTO budgets
-            (month, category_id, amount, alert_threshold, created_at, updated_at)
-            VALUES ('2026-09', ?, 500, 0.9, '2026-09-01', '2026-09-01')
-            """,
-            (expense_category_id,),
-        )
         conn.commit()
         conn.close()
+        self.save_budget("2026-09", expense_category_id, 500)
 
         dashboard = get_dashboard_summary("2026-09")
         income = get_income_analysis("2026-09")
@@ -298,6 +366,149 @@ class FinanceRegressionTests(unittest.TestCase):
         self.assertEqual(dashboard["budget"]["total"], budget["total_budget"])
         self.assertEqual(dashboard["monthly_income"], 1200)
         self.assertEqual(dashboard["monthly_expense"], 300)
+
+    def test_ledger_monthly_overview_preserves_scope_filters_and_daily_details(self):
+        primary_id = self.add_account("日常账户", balance=5000)
+        secondary_id = self.add_account("家庭账户", balance=2000)
+        conn = database.get_connection()
+        dining_id = conn.execute(
+            "SELECT id FROM categories WHERE name = '餐饮' AND type = 'expense'"
+        ).fetchone()["id"]
+        clothing_id = conn.execute(
+            "SELECT id FROM categories WHERE name = '服饰' AND type = 'expense'"
+        ).fetchone()["id"]
+        salary_id = conn.execute(
+            "SELECT id FROM categories WHERE name = '工资' AND type = 'income'"
+        ).fetchone()["id"]
+        conn.execute("UPDATE accounts SET owner = '小禾' WHERE id = ?", (secondary_id,))
+        conn.executemany(
+            """
+            INSERT INTO transactions
+            (account_id, category_id, amount, currency, exchange_rate_to_base,
+             base_amount, fx_status, direction, occurred_at, source, voided_at)
+            VALUES (?, ?, ?, 'CNY', 1, ?, 'captured', ?, ?, ?, ?)
+            """,
+            [
+                (primary_id, salary_id, 1000, 1000, "income", "2026-09-05", "manual", None),
+                (primary_id, dining_id, 300, 300, "expense", "2026-09-10", "manual", None),
+                (primary_id, clothing_id, 200, 200, "expense", "2026-09-10", "manual", None),
+                (primary_id, dining_id, 100, 100, "expense", "2026-09-20", "manual", None),
+                (secondary_id, dining_id, 90, 90, "expense", "2026-09-15", "manual", None),
+                (primary_id, salary_id, 700, 700, "income", "2026-08-05", "manual", None),
+                (primary_id, dining_id, 50, 50, "expense", "2026-08-06", "manual", None),
+                (primary_id, None, 999, 999, "expense", "2026-09-12", "transfer", None),
+                (primary_id, dining_id, 800, 800, "expense", "2026-09-13", "manual", "2026-09-14"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        overview = get_ledger_monthly_overview("2026-09")
+        self.assertEqual(overview["summary"]["income"], 1000)
+        self.assertEqual(overview["summary"]["expense"], 690)
+        self.assertEqual(overview["summary"]["balance"], 310)
+        self.assertEqual(overview["summary"]["previous_balance"], 650)
+        expense = overview["directions"]["expense"]
+        self.assertEqual(expense["count"], 4)
+        self.assertEqual(expense["highest_day"]["date"], "2026-09-10")
+        self.assertEqual(expense["highest_day"]["amount"], 500)
+        self.assertEqual(len(expense["daily"]), 30)
+        self.assertEqual(expense["daily"][9]["count"], 2)
+        self.assertEqual(expense["categories"][0]["name"], "餐饮")
+        self.assertEqual(expense["categories"][0]["amount"], 490)
+        self.assertEqual(expense["categories"][0]["count"], 3)
+
+        primary = get_ledger_monthly_overview("2026-09", account_id=primary_id)
+        self.assertEqual(primary["summary"]["expense"], 600)
+        self.assertEqual(primary["directions"]["expense"]["count"], 3)
+        secondary = get_ledger_monthly_overview("2026-09", owner="小禾")
+        self.assertEqual(secondary["summary"]["expense"], 90)
+        self.assertEqual(secondary["directions"]["expense"]["count"], 1)
+        from dataclasses import replace
+        foreign_family = replace(self.auth_context, family_id=self.auth_context.family_id + 1000)
+        hidden = get_ledger_monthly_overview("2026-09", account_id=primary_id, context=foreign_family)
+        self.assertEqual(hidden["summary"]["income"], 0)
+        self.assertEqual(hidden["directions"]["expense"]["count"], 0)
+        foreign_member = replace(self.auth_context, scope="personal", member_id=999999)
+        hidden = get_ledger_monthly_overview("2026-09", context=foreign_member)
+        self.assertEqual(hidden["summary"]["expense"], 0)
+
+    def test_monthly_overview_validates_months_and_handles_calendar_boundaries(self):
+        from pydantic import TypeAdapter
+        validator = TypeAdapter(BusinessMonth)
+        for value in ("2026-13", "2026-00", "0000-01", "2026-9", "2026-09-extra", ""):
+            with self.subTest(month=value), self.assertRaises(ValidationError):
+                validator.validate_python(value)
+        for month, days in (("2024-02", 29), ("2026-02", 28), ("9999-12", 31)):
+            overview = get_ledger_monthly_overview(month)
+            self.assertEqual(len(overview["directions"]["expense"]["daily"]), days)
+            self.assertEqual(overview["summary"]["balance"], 0)
+        january = get_ledger_monthly_overview("2026-01")
+        self.assertEqual(january["previous_month"], "2025-12")
+
+    def test_monthly_overview_sums_persisted_base_amounts_exactly_for_archived_accounts(self):
+        from decimal import Decimal
+        account_id = self.add_account("外币归档账户", currency="USD", exchange_rate=8)
+        conn = database.get_connection()
+        conn.executemany(
+            """
+            INSERT INTO transactions
+            (account_id, amount, currency, exchange_rate_to_base, base_amount,
+             fx_status, direction, occurred_at, source)
+            VALUES (?, 1, 'USD', 7, ?, 'captured', 'expense', ?, 'manual')
+            """,
+            [
+                (account_id, 100000000000000.00, "2026-09-01"),
+                *[(account_id, 0.01, "2026-09-01") for _ in range(10)],
+            ],
+        )
+        conn.execute("UPDATE accounts SET is_active = 0 WHERE id = ?", (account_id,))
+        conn.commit()
+        conn.close()
+        overview = get_ledger_monthly_overview("2026-09", account_id=account_id)
+        expected = Decimal("100000000000000.10")
+        self.assertEqual(overview["summary"]["expense"], expected)
+        self.assertEqual(overview["summary"]["balance"], -expected)
+        direction = overview["directions"]["expense"]
+        self.assertEqual(direction["categories"][0]["amount"], expected)
+        self.assertEqual(direction["categories"][0]["name"], "未分类")
+        self.assertEqual(direction["daily"][0]["amount"], expected)
+        self.assertEqual(direction["count"], 11)
+
+    def test_budget_totals_include_categories_without_a_budget_and_uncategorized_expense(self):
+        account_id = self.add_account("日常账户", balance=5000)
+        conn = database.get_connection()
+        dining_id = conn.execute(
+            "SELECT id FROM categories WHERE name = '餐饮' AND type = 'expense'"
+        ).fetchone()["id"]
+        clothing_id = conn.execute(
+            "SELECT id FROM categories WHERE name = '服饰' AND type = 'expense'"
+        ).fetchone()["id"]
+        conn.executemany(
+            """
+            INSERT INTO transactions
+            (account_id, category_id, amount, currency, exchange_rate_to_base,
+             base_amount, fx_status, direction, occurred_at, source)
+            VALUES (?, ?, ?, 'CNY', 1, ?, 'captured', 'expense', '2026-09-20', 'manual')
+            """,
+            [
+                (account_id, dining_id, 200, 200),
+                (account_id, clothing_id, 2000, 2000),
+                (account_id, None, 500, 500),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        self.save_budget("2026-09", dining_id, 1000)
+
+        budget = get_budget_monthly("2026-09")
+        dashboard = get_dashboard_summary("2026-09")
+
+        self.assertEqual(budget["budgeted_used"], 200)
+        self.assertEqual(budget["unbudgeted_expense"], 2500)
+        self.assertEqual(budget["total_used"], 2700)
+        self.assertEqual(budget["left"], -1700)
+        self.assertEqual(budget["total_used"], dashboard["monthly_expense"])
 
     def test_foreign_currency_transactions_use_captured_base_amount(self):
         usd_id = self.add_account("美元账户", currency="USD", exchange_rate=7)
@@ -328,19 +539,12 @@ class FinanceRegressionTests(unittest.TestCase):
             "SELECT id FROM categories WHERE name = '餐饮' AND type = 'expense'"
         ).fetchone()["id"]
         conn.execute(
-            """
-            INSERT INTO budgets
-            (month, category_id, amount, alert_threshold, created_at, updated_at)
-            VALUES ('2026-09', ?, 100, 0.9, '2026-09-01', '2026-09-01')
-            """,
-            (expense_category_id,),
-        )
-        conn.execute(
             "UPDATE accounts SET exchange_rate_to_base = 8 WHERE id = ?",
             (usd_id,),
         )
         conn.commit()
         conn.close()
+        self.save_budget("2026-09", expense_category_id, 100)
 
         self.assertEqual(stored["amount"], 100)
         self.assertEqual(stored["currency"], "USD")
@@ -403,15 +607,16 @@ class FinanceRegressionTests(unittest.TestCase):
         month = current_month()
         historical_month = add_months(month, -2)
         investment_id = self.add_account("投资", account_type="investment")
+        account = self.get_account(investment_id)
         conn = database.get_connection()
         conn.execute(
             """
             INSERT INTO holdings
-            (name, code, buy_price, quantity, current_price, account_id, asset_type,
-             market, currency, exchange_rate_to_base, updated_at)
-            VALUES ('测试持仓', 'TEST', 10, 10, 12, ?, 'stock', 'us', 'CNY', 1, ?)
+            (family_id, member_id, name, code, buy_price, quantity, current_price,
+             account_id, asset_type, market, currency, exchange_rate_to_base, updated_at)
+            VALUES (?, ?, '测试持仓', 'TEST', 10, 10, 12, ?, 'stock', 'us', 'CNY', 1, ?)
             """,
-            (investment_id, f"{month}-23"),
+            (account["family_id"], account["member_id"], investment_id, f"{month}-23"),
         )
         conn.executemany(
             """
@@ -500,11 +705,12 @@ class FinanceRegressionTests(unittest.TestCase):
 
         def delete_once():
             start.wait()
-            try:
-                delete_transaction(transaction_id)
-                return 200
-            except HTTPException as exc:
-                return exc.status_code
+            with use_auth_context(self.auth_context):
+                try:
+                    delete_transaction(transaction_id)
+                    return 200
+                except HTTPException as exc:
+                    return exc.status_code
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(delete_once) for _ in range(2)]
@@ -603,6 +809,15 @@ class FinanceRegressionTests(unittest.TestCase):
             database.init_db()
 
         conn = database.get_connection()
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
+        }
+        conn.close()
+        self.assertNotIn("currency", columns)
+
+        database.init_db(allow_unresolved=True)
+        conn = database.get_connection()
         row = conn.execute(
             """
             SELECT currency, exchange_rate_to_base, base_amount, fx_status
@@ -646,43 +861,72 @@ class FinanceRegressionTests(unittest.TestCase):
         self.assertIn({"date": second_month, "value": -100.0}, trend)
         self.assertNotIn({"date": first_month, "value": 1000.0}, trend)
 
-    def test_budget_edit_rejects_duplicate_month_and_category(self):
+    def test_budget_plan_rejects_duplicate_categories_and_unbalanced_totals(self):
         conn = database.get_connection()
         dining_id = conn.execute(
             "SELECT id FROM categories WHERE name = '餐饮' AND type = 'expense'"
         ).fetchone()["id"]
-        shopping_id = conn.execute(
-            "SELECT id FROM categories WHERE name = '购物' AND type = 'expense'"
-        ).fetchone()["id"]
-        conn.executemany(
-            """
-            INSERT INTO budgets
-            (month, category_id, amount, alert_threshold, created_at, updated_at)
-            VALUES ('2026-09', ?, ?, 0.9, '2026-09-01', '2026-09-01')
-            """,
-            [(dining_id, 500), (shopping_id, 600)],
-        )
-        conn.commit()
-        budget_id = conn.execute(
-            "SELECT id FROM budgets WHERE category_id = ?",
-            (shopping_id,),
-        ).fetchone()["id"]
         conn.close()
+        member_id = self.owner_member_id()
 
-        with self.assertRaises(HTTPException) as context:
-            update_budget(budget_id, BudgetCreate(
+        with self.assertRaises(ValidationError):
+            BudgetCreate(
                 month="2026-09",
-                category_id=dining_id,
-                amount=600,
-            ))
+                total_amount=1000,
+                categories=[
+                    BudgetCategoryAllocation(
+                        category_id=dining_id,
+                        amount=500,
+                        member_allocations=[
+                            MemberAmountAllocation(member_id=member_id, amount=500),
+                        ],
+                    ),
+                    BudgetCategoryAllocation(
+                        category_id=dining_id,
+                        amount=500,
+                        member_allocations=[
+                            MemberAmountAllocation(member_id=member_id, amount=500),
+                        ],
+                    ),
+                ],
+            )
+        with self.assertRaises(ValidationError):
+            BudgetCreate(
+                month="2026-09",
+                total_amount=1000,
+                categories=[
+                    BudgetCategoryAllocation(
+                        category_id=dining_id,
+                        amount=1000,
+                        member_allocations=[
+                            MemberAmountAllocation(member_id=member_id, amount=999.99),
+                        ],
+                    ),
+                ],
+            )
+        with self.assertRaises(ValidationError):
+            BudgetCreate(
+                month="2026-09",
+                total_amount=1000,
+                categories=[
+                    BudgetCategoryAllocation(
+                        category_id=dining_id,
+                        amount=900,
+                        member_allocations=[
+                            MemberAmountAllocation(member_id=member_id, amount=900),
+                        ],
+                    ),
+                ],
+            )
 
-        self.assertEqual(context.exception.status_code, 409)
-        conn = database.get_connection()
-        count = conn.execute(
-            "SELECT COUNT(*) AS count FROM budgets WHERE month = '2026-09'"
-        ).fetchone()["count"]
-        conn.close()
-        self.assertEqual(count, 2)
+    def test_goal_due_date_requires_a_real_iso_calendar_date(self):
+        payload = self.goal_payload("装修", 1000).model_dump()
+        with self.assertRaises(ValidationError):
+            GoalCreate(**{**payload, "due_date": "2026-02-30"})
+        with self.assertRaises(ValidationError):
+            GoalCreate(**{**payload, "due_date": "20260930"})
+        valid = GoalCreate(**{**payload, "due_date": " 2026-12-31 "})
+        self.assertEqual(valid.due_date, "2026-12-31")
 
     def test_analysis_queries_avoid_postgres_incompatible_grouping_and_having(self):
         class PostgresSyntaxGuard:
@@ -700,9 +944,10 @@ class FinanceRegressionTests(unittest.TestCase):
             def __getattr__(self, name):
                 return getattr(self.conn, name)
 
+        open_connection = database.get_connection
         with patch(
-            "services.get_connection",
-            side_effect=lambda: PostgresSyntaxGuard(database.get_connection()),
+            "infrastructure.database.get_connection",
+            side_effect=lambda: PostgresSyntaxGuard(open_connection()),
         ):
             get_expense_analysis("2026-09")
             get_income_analysis("2026-09")
@@ -737,6 +982,33 @@ class FinanceRegressionTests(unittest.TestCase):
                 amount=0,
                 occurred_at="not-a-date",
             )
+
+    def test_financial_date_inputs_require_canonical_iso_format(self):
+        invalid = "20260901"
+        cases = (
+            lambda: AccountCreate(
+                name="紧凑日期账户", type="debit_card", opening_date=invalid,
+            ),
+            lambda: TransactionCreate(
+                account_id=1, amount=1, direction="expense",
+                occurred_at=invalid,
+            ),
+            lambda: TransferCreate(
+                from_account_id=1, to_account_id=2, amount=1,
+                occurred_at=invalid,
+            ),
+            lambda: GoalRecordCreate(amount=1, recorded_at=invalid),
+        )
+        for build in cases:
+            with self.subTest(build=build), self.assertRaises(ValidationError):
+                build()
+        normalized = TransactionCreate(
+            account_id=1,
+            amount=1,
+            direction="expense",
+            occurred_at=" 2026-09-01 ",
+        )
+        self.assertEqual(normalized.occurred_at, "2026-09-01")
 
     def test_opening_balance_is_auditable_without_polluting_income(self):
         created = create_account(AccountCreate(
@@ -794,34 +1066,20 @@ class FinanceRegressionTests(unittest.TestCase):
         dining_id = conn.execute(
             "SELECT id FROM categories WHERE name = '餐饮' AND type = 'expense'"
         ).fetchone()["id"]
-        conn.execute(
-            """
-            INSERT INTO budgets
-            (month, category_id, amount, alert_threshold, created_at, updated_at)
-            VALUES ('2026-08', ?, 1000, 0.8, '2026-08-01', '2026-08-01')
-            """,
-            (dining_id,),
-        )
-        conn.commit()
         conn.close()
+        self.save_budget("2026-08", dining_id, 1000)
 
         copied = copy_monthly_budget(BudgetCopyCreate(
             source_month="2026-08",
             target_month="2026-09",
         ))
         self.assertEqual(copied["copied"], 1)
-        budget = get_budget_monthly("2026-09")["items"][0]
-        batch_update_budgets(BudgetBatchUpdate(items=[
-            BudgetBatchItem(id=budget["id"], amount=1250),
-        ]))
+        self.save_budget("2026-09", dining_id, 1250)
         self.assertEqual(get_budget_monthly("2026-09")["total_budget"], 1250)
 
     def test_goal_deposit_withdraw_and_archive_workflow(self):
-        goal_id = create_goal(GoalCreate(
-            name="旅行",
-            target_amount=10000,
-            current_amount=1000,
-            monthly_saving=500,
+        goal_id = create_goal(self.goal_payload(
+            "旅行", 10000, current_amount=1000, monthly_saving=500,
         ))["id"]
         create_goal_record(goal_id, GoalRecordCreate(
             amount=500,
@@ -850,21 +1108,55 @@ class FinanceRegressionTests(unittest.TestCase):
                 recorded_at="2026-09-22",
             ))
 
+    def test_goal_history_ignores_later_records_and_plan_is_independent(self):
+        goal_id = create_goal(self.goal_payload(
+            "历史目标", 100000, monthly_saving=5000,
+        ))["id"]
+        conn = database.get_connection()
+        conn.execute(
+            "UPDATE goals SET created_at = '2026-08-01T00:00:00' WHERE id = ?",
+            (goal_id,),
+        )
+        conn.commit()
+        conn.close()
+        create_goal_record(goal_id, GoalRecordCreate(
+            amount=10000,
+            recorded_at="2026-08-20",
+        ))
+        august_before = get_goals_overview("2026-08", "6m")
+        create_goal_record(goal_id, GoalRecordCreate(
+            amount=20000,
+            recorded_at="2026-09-20",
+        ))
+        august_after = get_goals_overview("2026-08", "6m")
+        september = get_goals_overview("2026-09", "6m")
+
+        self.assertEqual(august_before["current_total"], 10000)
+        self.assertEqual(august_after["current_total"], 10000)
+        self.assertEqual(august_after["goals"][0]["current_amount"], 10000)
+        self.assertEqual(september["current_total"], 30000)
+        august_point = next(item for item in september["plan"] if item["month"] == "2026-08")
+        september_point = next(item for item in september["plan"] if item["month"] == "2026-09")
+        self.assertEqual((august_point["actual"], september_point["actual"]), (1.0, 3.0))
+        self.assertEqual((august_point["plan"], september_point["plan"]), (0.5, 1.0))
+        self.assertNotEqual(september_point["plan"], september_point["actual"])
+
     def test_investment_trade_updates_holding_and_cash_atomically(self):
         account_id = self.add_account(
             "投资账户",
             account_type="investment",
             cash_available=2000,
         )
+        account = self.get_account(account_id)
         conn = database.get_connection()
         holding_id = conn.execute(
             """
             INSERT INTO holdings
-            (name, code, buy_price, quantity, current_price, account_id, asset_type,
-             market, currency, exchange_rate_to_base, updated_at)
-            VALUES ('测试股票', 'TEST', 10, 100, 10, ?, 'stock', 'cn', 'CNY', 1, '2026-09-01')
+            (family_id, member_id, name, code, buy_price, quantity, current_price,
+             account_id, asset_type, market, currency, exchange_rate_to_base, updated_at)
+            VALUES (?, ?, '测试股票', 'TEST', 10, 100, 10, ?, 'stock', 'cn', 'CNY', 1, '2026-09-01')
             """,
-            (account_id,),
+            (account["family_id"], account["member_id"], account_id),
         ).lastrowid
         conn.commit()
         conn.close()

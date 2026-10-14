@@ -3,6 +3,7 @@ import csv
 from pathlib import Path
 
 import database
+from money import rate
 
 
 CSV_FIELDS = [
@@ -47,13 +48,13 @@ def read_rates(path):
             raise ValueError(f"CSV 缺少列: {', '.join(sorted(missing_columns))}")
         for line_number, row in enumerate(reader, start=2):
             transaction_id = (row.get("transaction_id") or "").strip()
-            rate = (row.get("exchange_rate_to_base") or "").strip()
-            if not transaction_id or not rate:
+            rate_value = (row.get("exchange_rate_to_base") or "").strip()
+            if not transaction_id or not rate_value:
                 raise ValueError(f"CSV 第 {line_number} 行缺少流水 ID 或历史汇率")
             normalized_id = int(transaction_id)
             if normalized_id in rates:
                 raise ValueError(f"CSV 中流水 {normalized_id} 重复")
-            rates[normalized_id] = float(rate)
+            rates[normalized_id] = rate(rate_value)
     return rates
 
 

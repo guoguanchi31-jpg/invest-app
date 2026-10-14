@@ -10,3 +10,8 @@ node_modules/
 backups/
 .deploy/
 deploy/nginx/conf.d/https.conf
+deploy/test-results/
+.dbg/
+*.idsig
+/Invest-Android*.apk
+/debug-*.md

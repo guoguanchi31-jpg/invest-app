@@ -1,4 +1,9 @@
 {
+  "env": {
+    "APP_ENV": "production",
+    "AUTO_MIGRATE_ON_STARTUP": "0",
+    "ENABLE_SNAPSHOT_SCHEDULER": "0"
+  },
   "routes": [
     {
       "src": "/(.*)",

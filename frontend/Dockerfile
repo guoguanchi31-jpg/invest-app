@@ -3,6 +3,7 @@ FROM node:22-alpine AS build
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json ./
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org
 RUN npm ci
 
 COPY frontend/ .
@@ -23,6 +24,7 @@ COPY deploy/nginx/nginx.conf /etc/nginx/nginx.conf
 COPY deploy/nginx/snippets/ /etc/nginx/snippets/
 COPY deploy/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
+COPY downloads/Invest-Android.apk /usr/share/nginx/html/downloads/Invest-Android.apk
 
 EXPOSE 80 443
 

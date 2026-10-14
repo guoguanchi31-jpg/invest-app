@@ -1,14 +1,40 @@
 import argparse
 import os
 import sqlite3
+import tempfile
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import psycopg
 from psycopg import sql
-from database import FINANCIAL_TABLES
+import database
+from database import FINANCIAL_TABLES, IDENTITY_TABLES
 
 
-TABLES = FINANCIAL_TABLES
+TABLES = [*IDENTITY_TABLES, *FINANCIAL_TABLES]
+
+
+def prepare_sqlite_schema(sqlite_path):
+    previous = (database.DATABASE_URL, database.DB_DIR, database.DB)
+    database.DATABASE_URL = None
+    database.DB_DIR = str(sqlite_path.parent)
+    database.DB = str(sqlite_path)
+    try:
+        database.init_db()
+    finally:
+        database.DATABASE_URL, database.DB_DIR, database.DB = previous
+
+
+@contextmanager
+def prepared_sqlite_copy(sqlite_path):
+    with tempfile.TemporaryDirectory() as folder:
+        prepared = Path(folder) / "invest.db"
+        source_uri = f"file:{sqlite_path.resolve()}?mode=ro"
+        with closing(sqlite3.connect(source_uri, uri=True)) as source, \
+                closing(sqlite3.connect(prepared)) as target:
+            source.backup(target)
+        prepare_sqlite_schema(prepared)
+        yield prepared
 
 
 def sqlite_columns(conn, table):
@@ -55,7 +81,9 @@ def migrate(sqlite_path, replace):
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
 
-    with sqlite3.connect(sqlite_path) as source, psycopg.connect(database_url) as target:
+    with prepared_sqlite_copy(Path(sqlite_path)) as prepared_path, \
+            closing(sqlite3.connect(prepared_path)) as source, \
+            psycopg.connect(database_url) as target:
         source.row_factory = sqlite3.Row
         source.execute("BEGIN")
         validate_transaction_fx(source)

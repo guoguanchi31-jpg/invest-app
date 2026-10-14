@@ -2,23 +2,33 @@
 import argparse
 import csv
 import json
+import os
 from io import StringIO
 from urllib.request import Request, urlopen
 
-from routers.auth import create_access_token
+from routers.auth import create_access_token_for_username
 
 
 def verify(origin):
-    headers = {"Authorization": f"Bearer {create_access_token()}"}
-    for path, expected_type in [("/ledger", "application/json"), ("/ledger/export", "text/csv")]:
+    username = os.environ.get("APP_USERNAME", "").strip().lower()
+    if not username:
+        raise RuntimeError("APP_USERNAME is required for the explicit verification identity")
+    headers = {
+        "Authorization": f"Bearer {create_access_token_for_username(username)}"
+    }
+    for path, expected_type in [
+        ("/ledger?page=1&page_size=1", "application/json"),
+        ("/ledger/export", "text/csv"),
+    ]:
         with urlopen(Request(origin.rstrip("/") + path, headers=headers), timeout=30) as response:
             content_type = response.headers.get_content_type()
             if response.status != 200 or content_type != expected_type:
                 raise RuntimeError(f"{path}: expected 200 {expected_type}, got {response.status} {content_type}")
             text = response.read().decode("utf-8-sig")
-        if path == "/ledger":
-            if not isinstance(json.loads(text), list):
-                raise RuntimeError("/ledger: expected a JSON list")
+        if path.startswith("/ledger?"):
+            payload = json.loads(text)
+            if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+                raise RuntimeError("/ledger: expected a paginated JSON object")
         else:
             fields = next(csv.reader(StringIO(text)), [])
             if not {"方向", "金额", "汇率", "账户ID"}.issubset(fields):
