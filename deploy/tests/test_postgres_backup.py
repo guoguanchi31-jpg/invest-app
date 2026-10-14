@@ -120,6 +120,8 @@ class BackupOperations(unittest.TestCase):
                 backup_tool.drill(self.folder / result["file"], self.folder)
         self.assertIn("--network", calls[0])
         self.assertIn("none", calls[0])
+        self.assertIn("/proc/1/comm", " ".join(calls[1]))
+        self.assertIn("pg_isready -U postgres -d postgres", " ".join(calls[1]))
         self.assertNotIn("compose", " ".join(" ".join(args) for args in calls))
         self.assertEqual(calls[-1][:3], ["docker", "rm", "-fv"])
         report = json.loads(next(self.folder.glob("invest-restore-drill-*.json")).read_text())

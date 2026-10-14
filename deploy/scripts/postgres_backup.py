@@ -212,7 +212,13 @@ def drill(source, folder, image="postgres:16-alpine", expected_schema=None):
              "-e", "POSTGRES_HOST_AUTH_METHOD=trust", image], timeout=120)
         for attempt in range(60):
             try:
-                run(["docker", "exec", name, "pg_isready", "-U", "postgres"], timeout=5)
+                # The image starts a temporary server during init. Wait until the
+                # entrypoint has exec'd the final postgres process before restore.
+                run([
+                    "docker", "exec", name, "sh", "-c",
+                    'test "$(cat /proc/1/comm)" = postgres '
+                    '&& pg_isready -U postgres -d postgres',
+                ], timeout=5)
                 break
             except RuntimeError:
                 if attempt == 59:
