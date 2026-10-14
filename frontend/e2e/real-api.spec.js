@@ -114,7 +114,7 @@ test("real browser financial workflow", async ({ page }, testInfo) => {
   await expect(transactionDialog).toBeHidden();
 
   await page.getByRole("button", { name: "账本" }).click();
-  await page.getByRole("button", { name: "转账" }).click();
+  await page.getByRole("button", { name: "转账", exact: true }).click();
   const transferDialog = page.getByRole("dialog", { name: "资金划转" });
   await transferDialog.locator('select[name="from_account_id"]').selectOption(
     String(cashA.id),
