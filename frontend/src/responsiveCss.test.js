@@ -550,12 +550,18 @@ describe("responsive CSS ownership", () => {
     );
   });
 
-  it("keeps the ICP filing link centered at the bottom of the web workspace", () => {
+  it("keeps the filing links centered and wrapping at the bottom of the workspace", () => {
     expect(css).toMatch(
       /\.workspace\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*100vh;[^}]*flex-direction:\s*column/,
     );
     expect(css).toMatch(
       /\.site-footer\s*\{[^}]*margin-top:\s*auto;[^}]*text-align:\s*center/,
+    );
+    expect(css).toMatch(
+      /\.site-footer-records\s*\{[^}]*justify-content:\s*center;[^}]*flex-wrap:\s*wrap/,
+    );
+    expect(css).toMatch(
+      /\.site-footer a\s*\{[^}]*display:\s*inline-flex;[^}]*white-space:\s*nowrap/,
     );
   });
 });

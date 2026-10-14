@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 
 
+const PUBLIC_SECURITY_RECORD_NUMBER = "京公网安备11011302008442号";
+const PUBLIC_SECURITY_RECORD_URL =
+  "https://beian.mps.gov.cn/#/query/webSearch?code=11011302008442";
+
 const responses = {
   "/auth/session": {
     user: { id: 1, username: "admin", display_name: "大宝" },
@@ -310,6 +314,36 @@ test("loads the dashboard and navigates to the ledger", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "测试家庭财务总览" })).toBeVisible();
   await expect(page.getByRole("link", { name: "京ICP备2026067668号" }))
     .toHaveAttribute("href", "https://beian.miit.gov.cn/");
+  const publicSecurityLink = page.getByRole("link", {
+    name: PUBLIC_SECURITY_RECORD_NUMBER,
+  });
+  await expect(publicSecurityLink).toHaveAttribute("href", PUBLIC_SECURITY_RECORD_URL);
+  await expect(publicSecurityLink.locator("img")).toHaveAttribute(
+    "src",
+    "/beian-police.png",
+  );
+  const filingLayout = await page.locator(".site-footer-records").evaluate((element) => {
+    const linkRects = [...element.querySelectorAll("a")]
+      .map((link) => link.getBoundingClientRect());
+    const [icpRect, publicSecurityRect] = linkRects;
+    const icon = element.querySelector(".site-footer-police-record img");
+    const linksOverlap = !(
+      icpRect.right <= publicSecurityRect.left
+      || publicSecurityRect.right <= icpRect.left
+      || icpRect.bottom <= publicSecurityRect.top
+      || publicSecurityRect.bottom <= icpRect.top
+    );
+    return {
+      iconLoaded: icon.complete && icon.naturalWidth === 20 && icon.naturalHeight === 20,
+      linksOverlap,
+      overflows: element.scrollWidth > element.clientWidth,
+    };
+  });
+  expect(filingLayout).toEqual({
+    iconLoaded: true,
+    linksOverlap: false,
+    overflows: false,
+  });
   await expect(
     page.locator(".metric-card").filter({ hasText: "净资产" }).getByText("¥419,511.38"),
   ).toBeVisible();
@@ -376,6 +410,8 @@ test("runs guest interactions locally without calling the real API", async ({ pa
   await expect(appDownloadDialog).toBeHidden();
   await expect(page.getByRole("link", { name: "京ICP备2026067668号" }))
     .toHaveAttribute("href", "https://beian.miit.gov.cn/");
+  await expect(page.getByRole("link", { name: PUBLIC_SECURITY_RECORD_NUMBER }))
+    .toHaveAttribute("href", PUBLIC_SECURITY_RECORD_URL);
   const realLedgerButton = page.getByRole("button", { name: "登录真实账本" });
   const realLedgerLayout = await realLedgerButton.evaluate((button) => ({
     fits: button.scrollWidth <= button.clientWidth,
@@ -392,6 +428,7 @@ test("runs guest interactions locally without calling the real API", async ({ pa
   await expect(page.locator(".metric-card").first()).toContainText("¥");
   await expect(page.locator(".dashboard-grid .transaction-list .transaction")).toHaveCount(7);
   await expect(page.getByRole("link", { name: "京ICP备2026067668号" })).toBeVisible();
+  await expect(page.getByRole("link", { name: PUBLIC_SECURITY_RECORD_NUMBER })).toBeVisible();
   expect(apiRequests).toEqual([]);
 
   await page.getByRole("button", { name: "资产" }).click();

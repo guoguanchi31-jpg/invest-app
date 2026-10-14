@@ -10,6 +10,11 @@ import { clearSavedBudgetDrafts } from "./budgetDrafts";
 import StatementImportDialog from "./components/StatementImportDialog";
 import BackupDialog from "./components/BackupDialog";
 import FamilyDialog from "./components/FamilyDialog";
+import {
+  PUBLIC_SECURITY_RECORD_ICON,
+  PUBLIC_SECURITY_RECORD_NUMBER,
+  PUBLIC_SECURITY_RECORD_URL,
+} from "./components/SiteFooter";
 import App from "./App";
 import { fetchJson, patchJson, postJson } from "./api";
 import usePaginatedResource from "./usePaginatedResource";
@@ -329,6 +334,13 @@ it("shows the application preview before login without requesting protected data
   const icpLink = screen.getByRole("link", { name: "京ICP备2026067668号" });
   expect(icpLink.getAttribute("href")).toBe("https://beian.miit.gov.cn/");
   expect(icpLink.getAttribute("target")).toBe("_blank");
+  const publicSecurityLink = screen.getByRole("link", {
+    name: PUBLIC_SECURITY_RECORD_NUMBER,
+  });
+  expect(publicSecurityLink.getAttribute("href")).toBe(PUBLIC_SECURITY_RECORD_URL);
+  expect(publicSecurityLink.getAttribute("target")).toBe("_blank");
+  expect(publicSecurityLink.querySelector("img")?.getAttribute("src"))
+    .toBe(PUBLIC_SECURITY_RECORD_ICON);
   expect(screen.queryByLabelText("登录密码")).toBeNull();
   expect(fetchJson).not.toHaveBeenCalled();
 
